@@ -1,0 +1,41 @@
+name: bird_audio_ml
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  
+dependencies:
+  - python=3.11
+  - pytorch-cuda=12.1
+  - pytorch=2.2.2
+  - torchaudio=2.2.2
+  - torchvision
+  - librosa
+  - pydub=0.25.1
+  - timm
+  - numpy
+  - pytorch-lightning
+  - pandas
+  - tqdm
+  - ipython
+  - jupyter
+  - matplotlib
+  - plotly
+  - plotly_express
+  - scipy
+  - scikit-learn
+  - scikit-image
+  - seaborn
+  - albumentations
+  - opencv
+  - python-kaleido
+  - fastparquet
+  - pyarrow
+  - piexif
+  - pyyaml
+  - pysoundfile
+  - pip
+  - pip:
+    # Packages that are only on PyPi
+    #- some_crazy_package
+    - colorednoise
