@@ -10,16 +10,79 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 import timm
 import torch.nn as nn
-#from joblib import Parallel, delayed
 from joblib import Parallel, delayed
-#import tqdm
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 import pandas as pd
-from torch.utils.data import  DataLoader #delayed(process_clip)(audio_path, model=model) for audio_path in tqdm(test_
+from torch.utils.data import  DataLoader
+from bird_naming_utils import BirdNamer
+from pathlib import Path
+import re
+import argparse
+
+
+############################################# Parameters  ######################################
+##################################################################################################
+
+class DefaultConfig:
+    def __init__(self, bird_namer, options=None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if options:
+            if options['cpu_only']:
+                self.device = torch.device('cpu')
+            if options['num_cores']:
+                self.CORES = options['num_cores']
+            else:
+                self.CORES = 1
+        self.classes = bird_namer.bird_list
 
 
 
+class AudioParameters:
+    def __init__(self):
+        self.SR = 32000
+        self.FMIN = 20
+        self.FMAX = 14000 
 
+
+class FilePaths:
+    AUDIO_TYPES = {'.ogg','.wav', '.flac', '.mp3'}
+    def __init__(self, options=None):
+        self.root_folder = Path(options['project_root'])
+        self.data_folder = self.root_folder / 'Data'
+        self.experiment_results = self.data_folder / f"Experiments/Exp_{options['experiment']}/Results"
+        self.bird_list_path = self.experiment_results / f"exp_{options['experiment']}_bird_map.csv"
+        self.soundscapes_folder = self.root_folder /options['folder_to_process']
+        self.soundscapes = [path for path in self.soundscapes_folder.rglob('*') if path.suffix in self.AUDIO_TYPES]
+        self.predictions_csv = self.soundscapes_folder / 'predictions.csv'
+        self.learning_rate_monitor = self.experiment_results / f"exp_{options['experiment']}_training_metrics.jpg"
+        self.train_metric_monitor = self.experiment_results / 'learning_rate.jpg'
+        self.val_preds = self.experiment_results / 'val_pred_df.pkl'
+        self.val_targs = self.experiment_results / 'val_target_df.pkl'
+
+
+class ModelParameters:
+   def __init__(self, options=None):
+        self.parameters = [
+        {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
+                         'ckpt_path': f"{options['project_root']}/Data/Experiments/Exp_{options['experiment']}/Results/last.ckpt",
+                         'image_shape': (1,2), #The layout of 5-sec spectrograms stacked into the final image (height x width)
+                         'image_time': 10,
+                         'n_mels': 256,
+                         'n_fft': 2048,
+                         'use_deltas' : True,
+                         'hop_length': 1243,
+                         '5_sec_width': 128,
+                         'aggregation': 'mean',
+                         }, 
+        ]
+        if options and options.get('model_choice'):
+            model_choices = options['model_choice']
+            _parameters_list = [_parameters_list[i] for i in model_choices] 
+
+
+class Colour:
+    S = '\033[1m' + '\033[94m'
+    E = '\033[0m'
 
 def open_audio_clip(path, default_sr = 32000):   
     #Modify this to re-sample anything not using 32,000 sample rate
@@ -63,7 +126,6 @@ def compute_melspec(y, sr, hop_length, n_mels, n_fft, audio_params):
     return librosa.power_to_db(melspec)
 
 
-
 class PrepareImage():
     mean = .5
     std = .22
@@ -90,7 +152,6 @@ def get_images(audio_path, #PathLib Path object
     num_chunks = model_params['image_shape'][0] * model_params['image_shape'][1]
     chunk_length = model_params['image_time']//(num_chunks)
     prep_image = PrepareImage(height=n_mels, width=chunk_width)
-
 
     idxs  = []
     image_dict = {}
@@ -162,7 +223,6 @@ def crop_or_pad(y, length, train='train'):
             start = np.random.randint(len(y) - length)
         y = y[start: start + length]
     return y
-
 
 
 class AudioTransform:
@@ -539,3 +599,177 @@ def inference(test_audios, models, model_idx, cores=1):
     prediction_df.insert(0, 'row_id', final_row_ids)
     
     return prediction_df
+
+
+class DeriveResults():
+    def format_predictions(self, df, paths_list, threshold=0.5):
+        df.iloc[:,1:] = (df.iloc[:,1:] > threshold).astype(int)
+        file_map = {re.sub(r'_\d+\..*$', '', Path(fp).stem): fp for fp in paths_list}
+        df['root'] = df['row_id'].str.replace(r'_\d+$', '', regex=True)
+        df['filepath'] = df['root'].map(file_map)
+        df.drop(columns=['root'], inplace=True)
+        return df
+
+    def __init__(self, predictions, paths_list, save_folder=None, threshold=0.5):
+        self.predictions = self.format_predictions(predictions, paths_list, threshold=threshold)
+        self.save_folder = save_folder
+
+    def summarise(self, df):
+        def _summarise(group):
+            group.drop(columns=['row_id'], inplace=True)
+            group = group.loc[:, (group == 1).any()]
+            duration_seconds = len(group) * 5
+            remaining_columns = group.columns
+            column_sums = group.sum(axis=0).astype(int)
+            total_birds = group.sum().sum().astype(int)
+            sorted_with_values = [f'{col} ({column_sums[col]})' for col in column_sums.sort_values(ascending=False).index]
+            
+            all_birds = ', '.join(sorted_with_values)
+            num_birds = len(remaining_columns)
+
+            summary = pd.Series({
+                'Unique_Species_Ordered': all_birds,
+                'Unique_Species': num_birds,
+                'Total_Detections': int(total_birds),
+                'Length_(s)': duration_seconds
+            })
+            return summary
+
+        grouped = df.groupby('filepath')
+        summary_df = grouped.apply(_summarise, include_groups=False).reset_index(drop=False)
+        return summary_df
+
+    def first_detected(self, df):
+        def _first_detected(group):
+            group.drop(columns=['row_id'], inplace=True) 
+            group = group.reset_index(drop=True)
+            first_non_zero = group.apply(lambda col: col.ne(0).idxmax()*5 if col.ne(0).any() else np.nan)
+            return first_non_zero
+        grouped = df.groupby('filepath')
+        first_bird = grouped.apply(_first_detected, include_groups=False).reset_index(drop=False)
+        columns_to_convert = first_bird.columns[1:]
+        first_bird[columns_to_convert] = first_bird[columns_to_convert].astype(pd.Int64Dtype())
+        return first_bird
+
+    def last_detected(self, df):
+        def last_detected(group):
+            group.drop(columns=['row_id'], inplace=True) 
+            group = group.reset_index(drop=True)
+            length = len(group) * 5
+            last_non_zero = group.apply(lambda col: length - (col[::-1].ne(0).idxmax()) * 5 if col.ne(0).any() else np.nan)
+            return last_non_zero
+        grouped = df.groupby('filepath')
+        last_bird = grouped.apply(last_detected, include_groups=False).reset_index(drop=False)
+        columns_to_convert = last_bird.columns[1:]
+        last_bird[columns_to_convert] = last_bird[columns_to_convert].astype(pd.Int64Dtype())
+        return last_bird
+
+    def detections_per_minute(self, df):
+        def _detections_per_minute(group):
+            group.drop(columns=['row_id'], inplace=True) 
+            group = group.reset_index(drop=True)
+            minutes = len(group) / 12
+            column_sums = group.sum(axis=0).astype(int)
+            bird_rate = column_sums / minutes
+            bird_rates = pd.Series(bird_rate, index=group.columns).round(3).astype('float32')
+            return bird_rates
+        grouped = df.groupby('filepath')
+        bird_rate = grouped.apply(_detections_per_minute, include_groups=False).reset_index(drop=False) 
+        return bird_rate
+
+    def derive_results(self):
+        self.summary = self.summarise(self.predictions)
+        self.first_bird = self.first_detected(self.predictions)
+        self.last_bird = self.last_detected(self.predictions)
+        self.bird_rate = self.detections_per_minute(self.predictions)
+
+    def save_results(self, save_folder=None):
+        save_folder = save_folder if save_folder is not None else self.save_folder
+        save_folder = Path(save_folder) if not isinstance(save_folder, Path) else save_folder
+        self.summary.to_csv(save_folder / 'detection_summary.csv')
+        self.first_bird.to_csv(save_folder / 'first_bird.csv')
+        self.last_bird.to_csv(save_folder / 'last_bird.csv')
+        self.bird_rate.to_csv(save_folder / 'detections_per_minute.csv')
+
+    def print_results(self):
+        print(Colour.S + '\nThe summary dataframe' + Colour.E)
+        print(self.summary.iloc[:3,:8])
+        print(Colour.S + '\nThe first detection time for each species (s)' + Colour.E)
+        print(self.first_bird.iloc[:3,:8])
+        print(Colour.S + '\nThe last detection time from the end for each species  (s)' + Colour.E)
+        print(self.last_bird.iloc[:3,:8])
+        print(Colour.S + '\nThe detection rate, bird per minute for each species' + Colour.E)
+        print(self.bird_rate.iloc[:3,:8])
+
+
+############################################# Main Function  #####################################
+##################################################################################################
+
+def infer_soundscapes(use_case):
+    audio = AudioParameters()
+    paths = FilePaths(options=use_case)
+    bird_map_df = pd.read_csv(paths.bird_list_path)
+    birdnames = BirdNamer(bird_map_df)
+    cfg = DefaultConfig(bird_namer=birdnames, 
+                        options=use_case)
+    parameters = ModelParameters(options=use_case)
+    models = Models(config=cfg, 
+                    model_parameters=parameters, 
+                    audio_parameters=audio)
+
+    print('The inference folder is:', paths.soundscapes_folder)
+    print(f'There are {len(models.args_list)} model(s) to be ensembled')
+    print(f'The model(s) will predict the following {len(models.ebirds)} birds (referring to their https://ebird.org code): \n')
+    for i in range(0, len(models.ebirds), 10):
+        print(", ".join(models.ebirds[i:i + 10]))
+
+    prediction_dfs = []
+    for idx in range(len(models.args_list)):
+        df = inference(paths.soundscapes, models, idx, cores=cfg.CORES)
+        prediction_dfs.append(df)
+
+    prediction_columns = prediction_dfs[0].columns[1:]
+    values_list = [df[prediction_columns].values for df in prediction_dfs]
+    average_vals = np.zeros_like(values_list[0])
+
+    for array in values_list:
+        average_vals = average_vals + array 
+
+    average_vals = average_vals / len(values_list)
+    predictions = pd.DataFrame(data=average_vals, columns=prediction_columns)
+    predictions.insert(0, 'row_id', prediction_dfs[0]['row_id']) 
+    predictions.to_csv(paths.predictions_csv, index=False)
+
+    print(Colour.S + 'Raw prediction scores for the first 8 birds' + Colour.E)
+    print(predictions.iloc[:5, :8])
+
+    post_processor = DeriveResults(predictions, 
+                                   paths_list=paths.soundscapes, 
+                                   save_folder=paths.soundscapes_folder)
+    post_processor.derive_results()
+    post_processor.save_results()
+    post_processor.print_results()
+
+############################################  Run Main  ##########################################
+##################################################################################################
+
+if __name__ == '__main__':
+    options = {
+                'project_root': 'D:\Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
+                'experiment': 19,
+                'threshold': 0.2,
+                'folder_to_process': 'Data/Soundscapes/DOC_Tier1_2011/',
+                'model_choices': [0],
+                'cpu_only': False,
+                'num_cores': 1  #Can crank this up if using CPU only.
+                }
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kaytooPath", type=str, default=None, help="Filepath to the root directory (the parent of the 'Python' folder)")
+    parser.add_argument("--threshold", type=str, default=None, help="The prediction threshold.  Currently 0.3 looks about right")
+    parser.add_argument("--audioFolder", type=str, default=None, help="path to the processing folder, relative to the project root")
+    parser.add_argument("--cpuOnly", type=str, default=None, help="Force to process the audio files with CPU if you don't have an NVIDIA GPU with sufficent memory")
+    parser.add_argument("--num_cores", type=str, default=None, help="Number of CPU cores.  The more the better, but it may crash your system")
+
+    args = parser.parse_args()
+    infer_soundscapes(options)
