@@ -34,6 +34,7 @@ class DefaultConfig:
             else:
                 self.CORES = 1
         self.classes = bird_namer.bird_list
+        self.naming = options['naming_scheme']
 
 
 
@@ -48,23 +49,21 @@ class FilePaths:
     AUDIO_TYPES = {'.ogg','.wav', '.flac', '.mp3'}
     def __init__(self, options=None):
         self.root_folder = Path(options['project_root'])
+        self.models_folder = self.root_folder / 'Models'
         self.data_folder = self.root_folder / 'Data'
-        self.experiment_results = self.data_folder / f"Experiments/Exp_{options['experiment']}/Results"
-        self.bird_list_path = self.experiment_results / f"exp_{options['experiment']}_bird_map.csv"
-        self.soundscapes_folder = self.root_folder /options['folder_to_process']
+        self.predictions = Path(options['results_folder'])
+        self.bird_list_path = self.models_folder / f"exp_{options['experiment']}/Results/exp_{options['experiment']}_bird_map.csv"
+        self.soundscapes_folder = Path(options['folder_to_process'])
         self.soundscapes = [path for path in self.soundscapes_folder.rglob('*') if path.suffix in self.AUDIO_TYPES]
         self.predictions_csv = self.soundscapes_folder / 'predictions.csv'
-        self.learning_rate_monitor = self.experiment_results / f"exp_{options['experiment']}_training_metrics.jpg"
-        self.train_metric_monitor = self.experiment_results / 'learning_rate.jpg'
-        self.val_preds = self.experiment_results / 'val_pred_df.pkl'
-        self.val_targs = self.experiment_results / 'val_target_df.pkl'
-
+        
+        self.predictions.mkdir(parents=True, exist_ok=True)
 
 class ModelParameters:
    def __init__(self, options=None):
         self.parameters = [
         {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
-                         'ckpt_path': f"{options['project_root']}/Data/Experiments/Exp_{options['experiment']}/Results/last.ckpt",
+                         'ckpt_path': f"{options['project_root']}/Models/Exp_{options['experiment']}/Results/last.ckpt",
                          'image_shape': (1,2), #The layout of 5-sec spectrograms stacked into the final image (height x width)
                          'image_time': 10,
                          'n_mels': 256,
@@ -745,7 +744,7 @@ def infer_soundscapes(use_case):
 
     post_processor = DeriveResults(predictions, 
                                    paths_list=paths.soundscapes, 
-                                   save_folder=paths.soundscapes_folder)
+                                   save_folder=paths.predictions)
     post_processor.derive_results()
     post_processor.save_results()
     post_processor.print_results()
@@ -758,7 +757,9 @@ if __name__ == '__main__':
                 'project_root': 'D:\Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
                 'experiment': 19,
                 'threshold': 0.2,
-                'folder_to_process': 'Data/Soundscapes/DOC_Tier1_2011/',
+                'folder_to_process': 'D:/Kaytoo/Data/Soundscapes/DOC_Tier1_2011/',
+                'results_folder': 'D:/Kaytoo/Data/Predictions',
+                'naming_scheme' : 'Long',
                 'model_choices': [0],
                 'cpu_only': False,
                 'num_cores': 1  #Can crank this up if using CPU only.
