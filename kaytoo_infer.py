@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message='A new version')
 import albumentations as A
 import numpy as np
 import torchaudio
@@ -11,6 +13,8 @@ import torch.nn.functional as F
 import timm
 import torch.nn as nn
 from joblib import Parallel, delayed
+import multiprocessing
+multiprocessing.freeze_support()
 from tqdm import tqdm
 import pandas as pd
 from torch.utils.data import  DataLoader
@@ -18,7 +22,8 @@ from bird_naming_utils import BirdNamer
 from pathlib import Path
 import re
 import argparse
-
+import yaml
+import ast
 
 ############################################# Parameters  ######################################
 ##################################################################################################
@@ -37,7 +42,6 @@ class DefaultConfig:
         self.naming = options['naming_scheme']
 
 
-
 class AudioParameters:
     def __init__(self):
         self.SR = 32000
@@ -52,32 +56,52 @@ class FilePaths:
         self.models_folder = self.root_folder / 'Models'
         self.data_folder = self.root_folder / 'Data'
         self.predictions = Path(options['results_folder'])
-        self.bird_list_path = self.models_folder / f"exp_{options['experiment']}/Results/exp_{options['experiment']}_bird_map.csv"
+        self.bird_list_path = self.root_folder / 'Resources/bird_map.csv'
         self.soundscapes_folder = Path(options['folder_to_process'])
         self.soundscapes = [path for path in self.soundscapes_folder.rglob('*') if path.suffix in self.AUDIO_TYPES]
-        self.predictions_csv = self.soundscapes_folder / 'predictions.csv'
-        
+
         self.predictions.mkdir(parents=True, exist_ok=True)
 
 class ModelParameters:
    def __init__(self, options=None):
-        self.parameters = [
-        {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
-                         'ckpt_path': f"{options['project_root']}/Models/Exp_{options['experiment']}/Results/last.ckpt",
-                         'image_shape': (1,2), #The layout of 5-sec spectrograms stacked into the final image (height x width)
-                         'image_time': 10,
-                         'n_mels': 256,
-                         'n_fft': 2048,
-                         'use_deltas' : True,
-                         'hop_length': 1243,
-                         '5_sec_width': 128,
-                         'aggregation': 'mean',
-                         }, 
-        ]
-        if options and options.get('model_choice'):
-            model_choices = options['model_choice']
-            _parameters_list = [_parameters_list[i] for i in model_choices] 
-
+        '''
+        _parameters_list = [
+                            {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
+                                            'ckpt_path': model_path,
+                                            'image_shape': (1,2), #The layout of 5-sec spectrograms stacked into the final image (height x width)
+                                            'image_time': 10,
+                                            'n_mels': 256,
+                                            'n_fft': 2048,
+                                            'use_deltas' : True,
+                                            'hop_length': 1243,
+                                            '5_sec_width': 128,
+                                            'aggregation': 'mean',
+                                            }, 
+                            ] 
+        '''
+        if options['experiment'] is not None:
+            _deploy_fldr = f"{options['project_root']}/Data/Experiments/Exp_{options['experiment']}/Exp_{options['experiment']}_Deploy"
+            _deploy_fldrs = [Path(_deploy_fldr)]
+        else:
+            _models_dir = Path(f"{options['project_root']}/Models/")
+            _deploy_fldrs = [subdir for subdir in _models_dir.iterdir() if subdir.is_dir() and subdir.name.endswith('_Deploy')]
+            
+        self.parameters = []
+        for model_fldr in _deploy_fldrs:
+            ckpt_files = list(model_fldr.glob("*.ckpt"))
+            cfg_files = list(model_fldr.glob("*.yaml"))
+            if ckpt_files:
+                latest_ckpt = max(ckpt_files, key=lambda f: f.stat().st_mtime)  #There should only be one  
+                if cfg_files:
+                    latest_cfg = max(cfg_files, key=lambda f: f.stat().st_mtime)  #There should only be one
+                    with open(latest_cfg, "r") as f:
+                        model_config = yaml.load(f, Loader=yaml.FullLoader)
+                        model_config['ckpt_path'] = latest_ckpt
+                        self.parameters.append(model_config)
+                else:
+                    print(f'Warning: No configuration file was found in {str(model_fldr)}')
+            else:
+                    print(f'Warning: No checkpoint file was found in {str(model_fldr)}')    
 
 class Colour:
     S = '\033[1m' + '\033[94m'
@@ -581,7 +605,7 @@ def process_clip(audio_path, model):
 def inference(test_audios, models, model_idx, cores=1):
     bird_list = models.ebirds
     model = models.get_model(model_idx)
-    results = Parallel(n_jobs=cores)(
+    results = Parallel(n_jobs=cores, backend='threading')(
         delayed(process_clip)(audio_path, model=model) for audio_path in tqdm(test_audios, desc="Overall File List")
         )
     
@@ -601,17 +625,17 @@ def inference(test_audios, models, model_idx, cores=1):
 
 
 class DeriveResults():
-    def format_predictions(self, df, paths_list, threshold=0.5):
-        df.iloc[:,1:] = (df.iloc[:,1:] > threshold).astype(int)
+    def format_predictions(self, df, paths_list):
         file_map = {re.sub(r'_\d+\..*$', '', Path(fp).stem): fp for fp in paths_list}
         df['root'] = df['row_id'].str.replace(r'_\d+$', '', regex=True)
         df['filepath'] = df['root'].map(file_map)
         df.drop(columns=['root'], inplace=True)
         return df
 
-    def __init__(self, predictions, paths_list, save_folder=None, threshold=0.5):
-        self.predictions = self.format_predictions(predictions, paths_list, threshold=threshold)
+    def __init__(self, predictions, paths_list, save_folder):
+        self.predictions = self.format_predictions(predictions, paths_list)
         self.save_folder = save_folder
+        self.chosen_birds = {}
 
     def summarise(self, df):
         def _summarise(group):
@@ -637,6 +661,41 @@ class DeriveResults():
         grouped = df.groupby('filepath')
         summary_df = grouped.apply(_summarise, include_groups=False).reset_index(drop=False)
         return summary_df
+    
+    def summarise_one_bird(self, df, bird_name):
+        def _process_detections(group):
+            end_time = group['time'].iloc[-1]   #get from row_id, rather than assume a row time length
+            group = group.reset_index(drop=True)
+            non_zero_times = group.loc[group[bird_name] != 0,  'time'].tolist()
+            total = len(non_zero_times) 
+            fraction = round(total / len(group), 3)
+            end_minutes = end_time / 60
+            per_minute = round(total/end_minutes, 4)
+            if non_zero_times:
+                first = non_zero_times[0]
+                last = non_zero_times[-1]
+                from_end = end_time - last
+                all_non_zero = ', '.join(map(str, non_zero_times))
+            else:
+                first, last, from_end, all_non_zero = None, None, None, None
+
+            series = pd.Series({'First': first, 
+                                'Last': last, 
+                                'FromEnd': from_end, 
+                                'Total': total, 
+                                'FileLength' : end_time,
+                                'FractionTrue': fraction,
+                                'CallsPerMinute': per_minute,
+                                'AllDetections': all_non_zero}
+                                )
+
+            return series
+
+        df = df[['filepath', 'row_id', bird_name]].copy()
+        df['time'] = df['row_id'].str.extract(r'_(\d+)$').astype(int)
+        grouped = df.groupby('filepath')
+        df = grouped.apply(_process_detections, include_groups=False).reset_index(drop=False)       
+        return df
 
     def first_detected(self, df):
         def _first_detected(group):
@@ -646,21 +705,21 @@ class DeriveResults():
             return first_non_zero
         grouped = df.groupby('filepath')
         first_bird = grouped.apply(_first_detected, include_groups=False).reset_index(drop=False)
-        columns_to_convert = first_bird.columns[1:]
-        first_bird[columns_to_convert] = first_bird[columns_to_convert].astype(pd.Int64Dtype())
+        columns_to_convert = list(first_bird.columns[1:])
+        first_bird.loc[:,columns_to_convert] = first_bird[columns_to_convert]#.astype(pd.Int64Dtype())
         return first_bird
 
     def last_detected(self, df):
-        def last_detected(group):
+        def _last_detected(group):
             group.drop(columns=['row_id'], inplace=True) 
             group = group.reset_index(drop=True)
             length = len(group) * 5
             last_non_zero = group.apply(lambda col: length - (col[::-1].ne(0).idxmax()) * 5 if col.ne(0).any() else np.nan)
             return last_non_zero
         grouped = df.groupby('filepath')
-        last_bird = grouped.apply(last_detected, include_groups=False).reset_index(drop=False)
-        columns_to_convert = last_bird.columns[1:]
-        last_bird[columns_to_convert] = last_bird[columns_to_convert].astype(pd.Int64Dtype())
+        last_bird = grouped.apply(_last_detected, include_groups=False).reset_index(drop=False)
+        columns_to_convert = list(last_bird.columns[1:])
+        last_bird.loc[:,columns_to_convert] = last_bird[columns_to_convert]#.astype(pd.Int64Dtype())
         return last_bird
 
     def detections_per_minute(self, df):
@@ -675,7 +734,11 @@ class DeriveResults():
         grouped = df.groupby('filepath')
         bird_rate = grouped.apply(_detections_per_minute, include_groups=False).reset_index(drop=False) 
         return bird_rate
-
+    
+    def summarise_chosen_birds(self, birds_to_summarise):
+        for bird in birds_to_summarise:
+            self.chosen_birds[bird]=self.summarise_one_bird(self.predictions, bird)
+ 
     def derive_results(self):
         self.summary = self.summarise(self.predictions)
         self.first_bird = self.first_detected(self.predictions)
@@ -685,10 +748,14 @@ class DeriveResults():
     def save_results(self, save_folder=None):
         save_folder = save_folder if save_folder is not None else self.save_folder
         save_folder = Path(save_folder) if not isinstance(save_folder, Path) else save_folder
-        self.summary.to_csv(save_folder / 'detection_summary.csv')
-        self.first_bird.to_csv(save_folder / 'first_bird.csv')
-        self.last_bird.to_csv(save_folder / 'last_bird.csv')
-        self.bird_rate.to_csv(save_folder / 'detections_per_minute.csv')
+        self.summary.to_csv(save_folder / 'detection_summary.csv', index=False)
+        self.first_bird.to_csv(save_folder / 'first_bird.csv', index=False)
+        self.last_bird.to_csv(save_folder / 'last_bird.csv', index=False)
+        self.bird_rate.to_csv(save_folder / 'detections_per_minute.csv', index=False)
+        if self.chosen_birds:
+            for bird, summary in self.chosen_birds.items():
+                bird_no_spaces = bird.replace(" ", "_")
+                summary.to_csv(save_folder / f"{bird_no_spaces}_summary.csv", index=False)
 
     def print_results(self):
         print(Colour.S + '\nThe summary dataframe' + Colour.E)
@@ -699,6 +766,25 @@ class DeriveResults():
         print(self.last_bird.iloc[:3,:8])
         print(Colour.S + '\nThe detection rate, bird per minute for each species' + Colour.E)
         print(self.bird_rate.iloc[:3,:8])
+
+def merge_classes(df, ebirds, short_names):
+    name_df = pd.DataFrame({'ebirds': ebirds, 'short_name': short_names})
+    mergers = name_df.groupby('short_name').agg({'ebirds': list})
+    merger_dict = mergers['ebirds'].to_dict()
+    print(Colour.S + '\nThe following classes are being merged:' + Colour.E)
+    print(mergers[mergers['ebirds'].apply(len) > 1])
+    print(Colour.S + '\nThe final number of classes will be reduced to:' + Colour.E, f'{len(set(short_names))}')
+
+    merged_preds = {}
+    for name in mergers.index.to_list():
+        merging_cols = merger_dict[name]
+        merging_pred_vals = df[merging_cols].values
+        merged_preds[name] = np.any(merging_pred_vals, axis=1).astype(int)
+        merged_df = pd.DataFrame(merged_preds)
+        merged_df['row_id'] = df['row_id']
+        cols = ['row_id'] + [col for col in merged_df.columns if col != 'row_id']
+        merged_df = merged_df[cols]
+    return merged_df
 
 
 ############################################# Main Function  #####################################
@@ -715,6 +801,17 @@ def infer_soundscapes(use_case):
     models = Models(config=cfg, 
                     model_parameters=parameters, 
                     audio_parameters=audio)
+    summary_birds = use_case['birds_to_summarise']
+    naming_scheme = use_case['naming_scheme']
+    threshold = use_case['threshold']
+    
+    def _return_same(x):
+        return x  
+    _naming_methods = {'Short':_return_same, 
+                        'Long':birdnames.common_name, 
+                        'Scientific':birdnames.scientific_name, 
+                        'eBird':_return_same}
+    naming_method = _naming_methods[naming_scheme]
 
     print('The inference folder is:', paths.soundscapes_folder)
     print(f'There are {len(models.args_list)} model(s) to be ensembled')
@@ -722,6 +819,7 @@ def infer_soundscapes(use_case):
     for i in range(0, len(models.ebirds), 10):
         print(", ".join(models.ebirds[i:i + 10]))
 
+    #Run inference on the available models
     prediction_dfs = []
     for idx in range(len(models.args_list)):
         df = inference(paths.soundscapes, models, idx, cores=cfg.CORES)
@@ -735,17 +833,36 @@ def infer_soundscapes(use_case):
         average_vals = average_vals + array 
 
     average_vals = average_vals / len(values_list)
-    predictions = pd.DataFrame(data=average_vals, columns=prediction_columns)
+
+    #Deal with the various naming schemes, & thresholding
+    final_names = [naming_method(col_name) for col_name in prediction_columns]
+    predictions = pd.DataFrame(data=average_vals, columns=final_names)
     predictions.insert(0, 'row_id', prediction_dfs[0]['row_id']) 
-    predictions.to_csv(paths.predictions_csv, index=False)
 
     print(Colour.S + 'Raw prediction scores for the first 8 birds' + Colour.E)
     print(predictions.iloc[:5, :8])
+    predictions.to_csv(paths.predictions / 'prediction_probabilities.csv', index=False)
+    predictions.iloc[:,1:] = (predictions.iloc[:,1:] > threshold).astype(int)
 
+    print(Colour.S + 'Thresholded scores for the first 8 birds' + Colour.E)
+    print(predictions.iloc[:5, :8])
+
+    if naming_scheme == 'Short':
+        short_names  = birdnames.extra_names(birdnames.bird_list)  #we need to do this way for the one-many relationship
+        predictions = merge_classes(predictions, birdnames.bird_list, short_names)
+
+        print(Colour.S + 'Merged scores for the first 8 birds' + Colour.E)
+        print(predictions.iloc[:5, :8])
+
+    #Derive various alternative data represenations
     post_processor = DeriveResults(predictions, 
                                    paths_list=paths.soundscapes, 
-                                   save_folder=paths.predictions)
+                                   save_folder=paths.predictions,
+                                   )
     post_processor.derive_results()
+    if summary_birds and (summary_birds[0] != 'All'):
+        print(Colour.S + '\nBirds that will have individual summary files are: ' + Colour.E, summary_birds)
+        post_processor.summarise_chosen_birds(summary_birds)
     post_processor.save_results()
     post_processor.print_results()
 
@@ -753,24 +870,37 @@ def infer_soundscapes(use_case):
 ##################################################################################################
 
 if __name__ == '__main__':
+    #Default options for running during development
     options = {
                 'project_root': 'D:\Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
-                'experiment': 19,
+                'experiment': None, #None to use what ever is in the Models folder, otherwise an integer for the experiment number
                 'threshold': 0.2,
-                'folder_to_process': 'D:/Kaytoo/Data/Soundscapes/DOC_Tier1_2011/',
+                'folder_to_process': 'D:/Kaytoo/Data/Soundscapes/debugging',
                 'results_folder': 'D:/Kaytoo/Data/Predictions',
-                'naming_scheme' : 'Long',
-                'model_choices': [0],
+                'naming_scheme' : 'Scientific', #'Short, Long, Scientific, eBird'
                 'cpu_only': False,
-                'num_cores': 1  #Can crank this up if using CPU only.
+                'num_cores': 1,  #Can crank this up if using CPU only.
+                'birds_to_summarise':['Chlidonias albostriatus']  #['Australian Magpie'],  Black-fronted Tern blfter1	Chlidonias albostriatus	Tern
                 }
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kaytooPath", type=str, default=None, help="Filepath to the root directory (the parent of the 'Python' folder)")
-    parser.add_argument("--threshold", type=str, default=None, help="The prediction threshold.  Currently 0.3 looks about right")
-    parser.add_argument("--audioFolder", type=str, default=None, help="path to the processing folder, relative to the project root")
-    parser.add_argument("--cpuOnly", type=str, default=None, help="Force to process the audio files with CPU if you don't have an NVIDIA GPU with sufficent memory")
-    parser.add_argument("--num_cores", type=str, default=None, help="Number of CPU cores.  The more the better, but it may crash your system")
-
+    parser.add_argument("--project_root", type=str, default=None, help="Filepath to the root directory (parent of the 'Python' folder)")
+    parser.add_argument("--experiment", type=str, default=None, help="An integer for the experiment number, or None to models from /Models")
+    parser.add_argument("--threshold", type=str, default=None, help="The prediction threshold.  Currently 0.2 looks about right")
+    parser.add_argument("--folder_to_process", type=str, default=None, help="path to the processing folder, relative to the project root")
+    parser.add_argument("--results_folder", type=str, default=None, help="Folder to put the predictions")
+    parser.add_argument("--naming_scheme", type=str, default=None, help="A string that must be one of: 'Long', 'Short', 'eBird', 'Scientific'")
+    parser.add_argument("--cpu_only", type=bool, default=None, help="Force to process the audio files with CPU if you don't have an NVIDIA GPU with sufficent memory")
+    parser.add_argument("--num_cores", type=int, default=None, help="Number of CPU cores.  The more the better, but it may crash your system")
+    parser.add_argument("--birds_to_summarise", type=str, default=None, help="A string as a list of strings matching birds that need individual summary files")
     args = parser.parse_args()
+
+    for key in options.keys():
+        value = getattr(args, key)
+        if value is not None:
+            if key == 'birds_to_summarise':
+                options[key] = ast.literal_eval(value)
+            else:
+                options[key] = value
+    
     infer_soundscapes(options)
