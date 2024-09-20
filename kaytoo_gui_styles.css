@@ -8,7 +8,6 @@ QWidget{
 
 QMessageBox {
     background-color: #CEBAA8;
-
 }
 
 QMessageBox QLabel {
@@ -27,6 +26,48 @@ QMessageBox QPushButton {
     font-size: 16px;
     margin: 4px 2px;
     border-radius: 0px;
+}
+
+QPushButton#help {
+    background-color: #0d4733;
+    color: #989898;
+    border: 1px solid black;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    padding-left: 4px;
+    padding-right:4px;
+    margin-bottom: 0px;
+    margin-top: 20px;
+    text-align: center;
+    text-decoration: none;
+    font-size: 16px;
+    border-radius: 0px;
+}
+
+QPushButton#gpu_help {
+    background-color: #0d4733;
+    color: #989898;
+    border: 1px solid black;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    padding-left: 4px;
+    padding-right:4px;
+    margin-bottom: 0px;
+    margin-top: 0px;
+    text-align: center;
+    text-decoration: none;
+    font-size: 16px;
+    border-radius: 0px;
+}
+
+QPushButton#help:hover {
+    color:white;
+    font-weight: bold;
+}
+
+QPushButton#gpu_help:hover {
+    color:white;
+    font-weight: bold;
 }
 
 QMessageBox QPushButton:hover {
@@ -58,7 +99,7 @@ QCheckBox::indicator:unchecked{
 QCheckBox::indicator:checked{
     color: black;
     background-color: #CEBAA8;
-    image: url(../Images/checkmark.ico);
+    image: url(../Resources/Images/checkmark.ico);
     }
 
 QLineEdit{
@@ -108,7 +149,7 @@ HoverButton {
     }
 
 #logo { 
-        background-image: url("../Images/weka_small.jpg");background-repeat: no-repeat;
+        background-image: url("../Resources/Images/weka_small.jpg");background-repeat: no-repeat;
         background-position: top center;
         background-color: #0d4733;;
         font-weight: Medium;
