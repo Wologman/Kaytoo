@@ -26,7 +26,7 @@ class BirdNamer:
     def __init__(self, mapping_df):
         #modify this to ensure that the extra_name column of the mapping_df is filled
         self.bird_list = mapping_df['eBird'].tolist()
-        self.short_names_list = list(set(mapping_df['ExtraName']))
+        self.short_names_list = sorted(list(set(mapping_df['ExtraName'])))
         self.long_names_list = mapping_df['CommonName'].tolist()
         self.science_names_list = mapping_df['ScientificName'].tolist()
         self.mapping_dict = mapping_df.set_index('eBird').apply(tuple, axis=1).to_dict()

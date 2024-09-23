@@ -1,0 +1,88 @@
+CommonName,eBird,ScientificName,ExtraName,TrainSamples,ValSamples
+Australasian Bittern,ausbit1,Botaurus poiciloptilus,Bittern,67,8.0
+Australian Magpie,ausmag2,Gymnorhina tibicen,Magpie,242,27.0
+New Zealand Pipit,auspip3,Anthus novaeseelandiae,Pipit,420,47.0
+Australasian Shoveler,aussho1,Spatula rhynchotis,Shoveler,14,2.0
+Marsh Crake,baicra4,Zapornia pusilla,Crake,36,4.0
+Black-billed Gull,blbgul1,Chroicocephalus bulleri,Gull,12,1.0
+Black-fronted Tern,blfter1,Chlidonias albostriatus,Tern,44,5.0
+Black Swan,blkswa,Cygnus atratus,Swan,40,5.0
+Blue Whio,bluduc1,Hymenolaimus malacorhynchos,Whio,11,1.0
+California Quail,calqua,Callipepla californica,Quail,44,5.0
+Canada Goose,cangoo,Branta canadensis,Goose,204,22.0
+Caspian Tern,caster1,Hydroprogne caspia,Tern,10,0.0
+Chatham Robin,charob1,Petroica traversi,Robin,10,0.0
+Chatham Island Warbler,chiger2,Gerygone albofrontata ,Warbler,13,1.0
+Chukor,chukar,Alectoris chukar,Chukor,10,0.0
+Common Diving-Petrel,codpet1,Pelecanoides urinatrix,Petrel,10,0.0
+Chaffinch,comcha,Fringilla coelebs,Finch,10394,300.0
+Indian Myna,commyn,Acridotheres tristis,Myna,96,11.0
+Peafowl,compea,Pavo cristatus,Peafowl,21,2.0
+Redpoll,comred,Acanthis flammea,Redpoll,1497,166.0
+Cook's Petrel,coopet,Pterodroma cookii,Petrel,43,5.0
+Banded Dotterel,dobplo1,Charadrius bicinctus,Dotterel,12,1.0
+Dunnock,dunnoc1,Prunella modularis,Dunnock,872,97.0
+Eastern Rosella,easros1,Platycercus eximius,Rosella,10,1.0
+Blackbird,eurbla,Turdus merula ,Blackbird,13007,300.0
+Goldfinch,eurgol,Carduelis carduelis,Finch,218,25.0
+Greenfinch,eurgre1,Chloris chloris,Finch,485,53.0
+Starling,eursta,Sturnus vulgaris,Starling,126,14.0
+New Zealand Fernbird,fernbi1,Poodytes punctatus,Fernbird,51,6.0
+Grey Teal,gretea1,Anas gracilis,Teal,11,1.0
+Great Spotted Kiwi,grskiw1,Apteryx haastii,Spotted Kiwi,1063,119.0
+Grey Warbler,gryger1,Gerygone igata,Warbler,20410,300.0
+House Sparrow,houspa,Passer domesticus,Sparrow,39,4.0
+Kea,kea1,Nestor notabilis,Kea,2928,300.0
+Southern Black-backed Gull,kelgul,Larus dominicanus,Gull,114,13.0
+North Island Kokako,kokako3,Callaeas wilsoni,Kokako,12,1.0
+Gull,larus,Larinae sp.,Gull,20,2.0
+Little Spotted Kiwi,liskiw1,Apteryx owenii,Spotted Kiwi,91,10.0
+Little Owl,litowl1,Athene noctua,Owl,17,2.0
+Little Blue Penguin,litpen1,Eudyptula minor,Penguin,23,2.0
+Long-tailed Cuckoo,lotkoe1,Urodynamis taitensis,Cuckoo,6761,300.0
+Mallard Duck,mallar3,Anas platyrhynchos,Duck,24,3.0
+Spur-winged Plover,maslap1,Vanellus miles,Plover,224,25.0
+Morepork,morepo2,Ninox novaeseelandiae,Morepork,29700,300.0
+Mottled Petrel,motpet,Pterodroma inexpectata,Petrel,11,1.0
+Bellbird,nezbel1,Anthornis melanura,Bellbird,29700,300.0
+New Zealand Falcon,nezfal1,Falco novaeseelandiae,Falcon,211,23.0
+Fantail,nezfan1,Rhipidura fuliginosa ,Fantail,8493,300.0
+New Zealand Kaka,nezkak1,Nestor meridionalis ,Kaka,10812,300.0
+Kereru,nezpig2,Hemiphaga novaeseelandiae,Kereru,142,16.0
+North Island Robin,nezrob2,Petroica longipes,Robin,1977,220.0
+South Island Robin,nezrob3,Petroica australis,Robin,2281,253.0
+North Island Brown Kiwi,nibkiw1,Apteryx mantelli,Brown Kiwi,631,70.0
+Okarito Brown Kiwi ,okbkiw1,Apteryx rowi,Brown Kiwi,11,1.0
+Oystercatcher,oyster1,Haematopus sp ,Oystercatcher,152,17.0
+Parakeet,parake,Psittaciformes sp.,Parakeet,2579,286.0
+Black Petrel,parpet1,Procellaria parkinsoni,Petrel,10,0.0
+Paradise Shelduck,parshe1,Tadorna variegata,Shelduck,170,18.0
+Pied Stilt,piesti1,Himantopus leucocephalus,Stilt,50,6.0
+Brown Creeper,pipipi1,Mohoua novaeseelandiae,Creeper,1052,117.0
+Pukeko,purswa6,Porphyrio melanotus,Pukeko,855,95.0
+Red-billed Gull,rebgul1,Chroicocephalus novaehollandiae scopulinus,Gull,115,12.0
+Domestic Chicken,redjun1,Gallus gallus,Chicken,10,0.0
+Rifleman,riflem1,Acanthisitta chloris ,Rifleman,8182,300.0
+Common Pheasant,rinphe1,Phasianus colchicus,Pheasant,13,2.0
+New Zealand Kingfisher,sackin1,Todiramphus sanctus ,Kingfisher,945,105.0
+North Island Saddleback,saddle2,Philesturnus rufusater,Saddleback,11,1.0
+Shining Cuckoo,shbcuc1,Chrysococcyx lucidus,Cuckoo,758,84.0
+Silvereye,silver3,Zosterops lateralis,Silvereye,29700,300.0
+Skylark,skylar,Alauda arvensis,Skylark,2465,274.0
+Southern Brown Kiwi,sobkiw2,Apteryx australis,Brown Kiwi,1380,153.0
+Rock Wren,soiwre1,Xenicus gilviventris,Wren,77,9.0
+Song Thrush,sonthr1,Turdus philomelos,Thrush,2438,271.0
+Spotted Crake,spocra1,Porzana porzana ,Crake,10,0.0
+Spotless Crake,spocra2,Zapornia tabuensis,Crake,10,0.0
+Australasian Harrier,swahar1,Circus approximans,Harrier,44,5.0
+Takahe,takahe3,Porphyrio hochstetteri,Takahe,10,0.0
+Tomtit,tomtit1,Petroica macrocephala,Tomtit,29700,300.0
+Tui,tui1,Prosthemadera novaeseelandiae,Tui,11150,300.0
+Weka,weka1,Gallirallus australis,Weka,2658,295.0
+Welcome Swallow,welswa1,Hirundo neoxena,Swallow,16,2.0
+Tree Weta,weta,Hemideina sp.,Weta,3910,300.0
+White-fronted Tern,whfter1,Sterna striata,Tern,20,3.0
+Whitehead,whiteh1,Mohoua albicilla,Whitehead,981,109.0
+Grey or Mallard Duck,x00458,Anas platyrhynchos x superciliosa,Duck,75,8.0
+Yellowhammer,yellow2,Emberiza citrinella,Yellowhammer,920,102.0
+Mohua,yellow3,Mohoua ochrocephala,Mohua,86,9.0

@@ -1,5 +1,6 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message='A new version')
+warnings.filterwarnings("ignore", category=UserWarning, message='Error fetching version')
 import albumentations as A
 import numpy as np
 import torchaudio
@@ -835,13 +836,13 @@ def infer_soundscapes(use_case):
     average_vals = average_vals / len(values_list)
 
     #Deal with the various naming schemes, & thresholding
-    final_names = [naming_method(col_name) for col_name in prediction_columns]
-    predictions = pd.DataFrame(data=average_vals, columns=final_names)
+    renaming_dict = {col_name:naming_method(col_name) for col_name in prediction_columns}
+    predictions = pd.DataFrame(data=average_vals, columns=prediction_columns)
     predictions.insert(0, 'row_id', prediction_dfs[0]['row_id']) 
 
     print(Colour.S + 'Raw prediction scores for the first 8 birds' + Colour.E)
     print(predictions.iloc[:5, :8])
-    predictions.to_csv(paths.predictions / 'prediction_probabilities.csv', index=False)
+    predictions.to_csv(paths.predictions / 'prediction_probabilities_ebird.csv', index=False)
     predictions.iloc[:,1:] = (predictions.iloc[:,1:] > threshold).astype(int)
 
     print(Colour.S + 'Thresholded scores for the first 8 birds' + Colour.E)
@@ -850,9 +851,11 @@ def infer_soundscapes(use_case):
     if naming_scheme == 'Short':
         short_names  = birdnames.extra_names(birdnames.bird_list)  #we need to do this way for the one-many relationship
         predictions = merge_classes(predictions, birdnames.bird_list, short_names)
-
         print(Colour.S + 'Merged scores for the first 8 birds' + Colour.E)
         print(predictions.iloc[:5, :8])
+
+    predictions.rename(columns=renaming_dict, inplace=True)
+    predictions.to_csv(paths.predictions / 'binary_predictions_renamed.csv', index=False)
 
     #Derive various alternative data represenations
     post_processor = DeriveResults(predictions, 

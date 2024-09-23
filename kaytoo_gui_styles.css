@@ -99,7 +99,9 @@ QCheckBox::indicator:unchecked{
 QCheckBox::indicator:checked{
     color: black;
     background-color: #CEBAA8;
-    image: url(../Resources/Images/checkmark.ico);
+    /*background-image: url("../Resources/Images/weka_small.png");*/
+    /*background-image: url("../Resources/Images/checked_small.png");*/
+    border-image: url("../Resources/Images/checkmark.ico");
     }
 
 QLineEdit{
@@ -149,7 +151,8 @@ HoverButton {
     }
 
 #logo { 
-        background-image: url("../Resources/Images/weka_small.jpg");background-repeat: no-repeat;
+        background-image: url("../Resources/Images/weka_small.jpg");
+        background-repeat: no-repeat;
         background-position: top center;
         background-color: #0d4733;;
         font-weight: Medium;

@@ -1,6 +1,7 @@
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message='A new version')
+warnings.filterwarnings("ignore", category=UserWarning, message='Error fetching version')
 import sys
 import pathlib
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon,QHBoxLayout, QGraphicsDropShadowEffect, QWidget, QLabel, QLineEdit, QComboBox, QPushButton, QVBoxLayout, QFileDialog, QCheckBox, QMessageBox, QMainWindow
@@ -152,7 +153,6 @@ class MainWindow(QMainWindow):
         self.output_button = HoverButton("Browse for folder")
         self.output_button.clicked.connect(self.select_output_file)
 
-
         _thresholds_list = ['0.1', '0.2', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.9']
         
         self.threshold_label = QLabel("Detection Threshold:")
@@ -170,7 +170,6 @@ class MainWindow(QMainWindow):
         self.threshold_v_layout = QVBoxLayout()
         self.threshold_v_layout.addLayout(self.threshold_h_layout)
         self.threshold_v_layout.addWidget(self.threshold_combobox)
-
 
         _core_list = [1, 2, 4, 6, 8, 12, 16, 24, 36]
         _avalable_cores = os.cpu_count()
