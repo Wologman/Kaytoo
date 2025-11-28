@@ -1,6 +1,7 @@
 import warnings
+import os
 warnings.filterwarnings("ignore", category=UserWarning, message='A new version')
-warnings.filterwarnings("ignore", category=UserWarning, message='Error fetching version')
+from typing import Dict, List, Optional, Tuple, Union, Any
 import albumentations as A
 import numpy as np
 import torchaudio
@@ -18,29 +19,44 @@ import multiprocessing
 multiprocessing.freeze_support()
 from tqdm import tqdm
 import pandas as pd
-from torch.utils.data import  DataLoader
+from torch.utils.data import  DataLoader  # ISSUE #15: Extra space in import
 from bird_naming_utils import BirdNamer
 from pathlib import Path
-import re
+import re  # ISSUE #11: Unused import - remove if not needed
 import argparse
 import yaml
+import random
 import ast
+import matplotlib.pyplot as plt  # ISSUE #11: Unused import - only used in commented code
+from test_cuda import test_cuda
 
 ############################################# Parameters  ######################################
 ##################################################################################################
 
 class DefaultConfig:
-    def __init__(self, bird_namer, options=None):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self,
+                 bird_namer: BirdNamer,
+                 options: Optional[dict]=None):
+        self.classes = bird_namer.bird_list
         if options:
             if options['cpu_only']:
                 self.device = torch.device('cpu')
+            else:
+                device, gpu = test_cuda()
+                if gpu:
+                    device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+                    print("Using GPU:", device_name)
+                    self.device = torch.device(device)
             if options['num_cores']:
                 self.CORES = options['num_cores']
             else:
                 self.CORES = 1
-        self.classes = bird_namer.bird_list
-        self.naming = options['naming_scheme']
+            self.naming = options['naming_scheme']
+        else:
+            device, gpu = test_cuda()
+            self.naming = 'eBird'
+            self.device = torch.device(device)
+            self.cores = os.cpu_count()//2 or 1
 
 
 class AudioParameters:
@@ -53,18 +69,18 @@ class AudioParameters:
 class FilePaths:
     AUDIO_TYPES = {'.ogg','.wav', '.flac', '.mp3'}
     def __init__(self, options=None):
-        self.root_folder = Path(options['project_root'])
-        self.models_folder = self.root_folder / 'Models'
-        self.data_folder = self.root_folder / 'Data'
+        self.root_folder = Path(options['project_root'])  # ISSUE #1: No validation that paths exist or are accessible
+        self.models_folder = self.root_folder / 'models'
+        self.data_folder = self.root_folder / 'data'
         self.predictions = Path(options['results_folder'])
-        self.bird_list_path = self.root_folder / 'Resources/bird_map.csv'
-        self.soundscapes_folder = Path(options['folder_to_process'])
+        self.bird_list_path = self.root_folder / 'resources/bird_map.csv'
+        self.soundscapes_folder = Path(options['folder_to_process'])  # ISSUE #1: No validation that paths exist or are accessible
         self.soundscapes = [path for path in self.soundscapes_folder.rglob('*') if path.suffix in self.AUDIO_TYPES]
-
         self.predictions.mkdir(parents=True, exist_ok=True)
 
+
 class ModelParameters:
-   def __init__(self, options=None):
+   def __init__(self, options=None):  # ISSUE #15: Inconsistent indentation (3 spaces vs 4)
         '''
         _parameters_list = [
                             {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
@@ -73,6 +89,8 @@ class ModelParameters:
                                             'image_time': 10,
                                             'n_mels': 256,
                                             'n_fft': 2048,
+                                            'double_audio': False,
+                                            'buffer_audio': 0,
                                             'use_deltas' : True,
                                             'hop_length': 1243,
                                             '5_sec_width': 128,
@@ -81,14 +99,14 @@ class ModelParameters:
                             ] 
         '''
         if options['experiment'] is not None:
-            _deploy_fldr = f"{options['project_root']}/Data/Experiments/Exp_{options['experiment']}/Exp_{options['experiment']}_Deploy"
-            _deploy_fldrs = [Path(_deploy_fldr)]
+            _deploy_fldr = f"{options['project_root']}/data/experiments/exp_{options['experiment']}/exp_{options['experiment']}_deploy"
+            _deploy_folders = [Path(_deploy_fldr)]
         else:
-            _models_dir = Path(f"{options['project_root']}/Models/")
-            _deploy_fldrs = [subdir for subdir in _models_dir.iterdir() if subdir.is_dir() and subdir.name.endswith('_Deploy')]
+            _models_dir = Path(f"{options['project_root']}/models/")
+            _deploy_folders = [subdir for subdir in _models_dir.iterdir() if subdir.is_dir() and subdir.name.endswith('_deploy')]
             
         self.parameters = []
-        for model_fldr in _deploy_fldrs:
+        for model_fldr in _deploy_folders:
             ckpt_files = list(model_fldr.glob("*.ckpt"))
             cfg_files = list(model_fldr.glob("*.yaml"))
             if ckpt_files:
@@ -96,42 +114,70 @@ class ModelParameters:
                 if cfg_files:
                     latest_cfg = max(cfg_files, key=lambda f: f.stat().st_mtime)  #There should only be one
                     with open(latest_cfg, "r") as f:
-                        model_config = yaml.load(f, Loader=yaml.FullLoader)
+                        model_config = yaml.load(f, Loader=yaml.FullLoader)  # Using FullLoader to support Python tuples in YAML (safer than default loader)
                         model_config['ckpt_path'] = latest_ckpt
                         self.parameters.append(model_config)
                 else:
-                    print(f'Warning: No configuration file was found in {str(model_fldr)}')
+                    print(f'Warning: No configuration file was found in {str(model_fldr)}')  # ISSUE #9: Use logging instead of print
             else:
-                    print(f'Warning: No checkpoint file was found in {str(model_fldr)}')    
+                    print(f'Warning: No checkpoint file was found in {str(model_fldr)}')  # ISSUE #9: Use logging instead of print    
+
 
 class Colour:
     S = '\033[1m' + '\033[94m'
     E = '\033[0m'
 
-def open_audio_clip(path, default_sr = 32000):   
-    #Modify this to re-sample anything not using 32,000 sample rate
-    try:  
-        y, sr = torchaudio.load(path)
-        if y.ndim == 2 and y.shape[0] == 2:
-            y = torch.mean(y, dim=0).unsqueeze(0)  # from stereo to mono
-        y = y.squeeze().numpy() 
-    except:
-        y = np.random.randn(5*default_sr)
-        sr = default_sr 
-        print(f'could not open {path}')
 
+def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 10) -> np.ndarray:
+    """Open an audio clip and ensure it is a valid, finite 1D numpy array.
+    On error or invalid input, replaces with random noise.
+    """
+    try:
+        y, sr = torchaudio.load(path)
+        # Convert stereo to mono
+        if y.ndim == 2 and y.shape[0] == 2:
+            y = torch.mean(y, dim=0)
+        y = y.squeeze().numpy()
+        if y.size == 0:
+            print(f"[WARN] {path} -> empty array returned from torchaudio.load(); replacing with noise")
+            y = np.random.randn(default_sr * min_duration)
+            sr = default_sr
+    except Exception as e:
+        print(f"[WARN] Could not open {path}: {e}")
+        y = np.random.randn(default_sr * min_duration)
+        sr = default_sr
+
+    # Replace NaN or Inf with zeros
+    if not np.isfinite(y).all():
+        print(f"[WARN] Invalid (NaN/Inf) values found in {path}, replaced with zeros.")
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Normalize safely (avoid divide by zero)
+    max_val = np.max(np.abs(y))
+    if max_val == 0 or not np.isfinite(max_val):
+        print(f"[WARN] Zero or invalid max value in {path}, skipping normalization.")
+    else:
+        y = y / max_val
+
+    # Resample if needed
     if sr != default_sr:
         num_samples = int(len(y) * default_sr / sr)
         y = resample(y, num_samples)
-    
-    if not np.isfinite(y).all():
-        y[np.isnan(y)] = np.zeros_like(y)
-        y[np.isinf(y)] = np.max(y)
+        sr = default_sr
+
+    # Pad or trim to at least `min_duration` seconds
+    required_samples = int(min_duration * default_sr)
+    if len(y) < required_samples:
+        pad_len = required_samples - len(y)
+        y = np.concatenate([y, np.random.randn(pad_len)])
+        print(f"[INFO] Padded {path} to {len(y)/default_sr:.1f} s")
+
+    assert np.isfinite(y).all(), f"[FATAL] Non-finite values persist in {path}!"
     return y
 
 
 
-def compute_melspec(y, sr, hop_length, n_mels, n_fft, audio_params):
+def compute_melspec(y: np.ndarray, sr: int, hop_length: int, n_mels: int, n_fft: int, audio_params: Optional[AudioParameters]) -> np.ndarray:
     if audio_params:
         fmin = audio_params.FMIN
         fmax = audio_params.FMAX
@@ -163,18 +209,26 @@ class PrepareImage():
         ])
 
 
-def get_images(audio_path, #PathLib Path object
-               model_params,
-               audio_params,
-               clip_length=None,
-               sr=32000):
+def get_images(audio_path: Path,
+               model_params: Dict[str, Any],
+               audio_params: AudioParameters,
+               clip_length: Optional[int] = None,
+               sr: int = 32000) -> Tuple[Dict[int, np.ndarray], int]:
     
+    double = model_params['double_audio']
+    buffer = model_params['buffer_audio'] * sr
+    trim = abs(buffer)
     hop_length = model_params['hop_length']
     n_mels = model_params['n_mels']
     n_fft = model_params['n_fft']
     chunk_width = model_params['5_sec_width']
     num_chunks = model_params['image_shape'][0] * model_params['image_shape'][1]
-    chunk_length = model_params['image_time']//(num_chunks)
+    
+    if model_params['double_audio']:  #note that buffer_audio can be < 0
+        chunk_length = int(((model_params['image_time']-2*model_params['buffer_audio'])/2)//num_chunks)
+    else:
+        chunk_length = int((model_params['image_time']-2*model_params['buffer_audio'])//(num_chunks))
+    
     prep_image = PrepareImage(height=n_mels, width=chunk_width)
 
     idxs  = []
@@ -183,23 +237,44 @@ def get_images(audio_path, #PathLib Path object
     if clip_length is None:
         clip_length = len(_y) // sr
 
-    for index in range(0, clip_length // chunk_length):
+
+    print("clip_length (sec):", clip_length)
+    print("chunk_length (sec):", chunk_length)
+    print("loop iterations:", int(clip_length) // chunk_length)
+
+    for index in range(0, int(clip_length) // chunk_length):
         idxs.append(index)
         start = index * chunk_length
         stop = start + chunk_length
         start_idx = sr * start
         stop_idx =  sr * stop
         
-        if stop_idx > len(_y):
-            y = _y[start_idx:]
-            remaining_length = stop_idx - len(_y)  # Calculate how much we need to fill
-            noise = np.random.randn(remaining_length) * np.std(_y)
-            y = np.concatenate((y, noise))
-        else: 
-            y = _y[start_idx: stop_idx]
+        if double and buffer>=0:
+            if index == 0:
+                y = np.concatenate((_y[:buffer], _y[:stop_idx], _y[:stop_idx + buffer]))
+            elif index == 11:  # ISSUE #6: Magic number 11 - should use total_chunks - 1 instead
+                y = np.concatenate((_y[start_idx-buffer:],  _y[start_idx:], _y[-buffer:]))
+            else:
+                y = np.concatenate((_y[start_idx-buffer:stop_idx], _y[start_idx:stop_idx+buffer]))
+        elif double and buffer < 0:
+                _core = _y[start_idx:stop_idx]
+                y = np.concatenate((_core[trim:], _core[:-trim]))
+        else:
+            if stop_idx > len(_y):
+                y = _y[start_idx:]
+                remaining_length = stop_idx - len(_y)  # Calculate how much we need to fill
+                noise = np.random.randn(remaining_length) * np.std(_y)
+                y = np.concatenate((y, noise))
+            else: 
+                y = _y[start_idx: stop_idx]
         
         max_vol = np.abs(y).max()
-        y = y * 1 / max_vol    #y, sr, hop_length, n_mels, n_fft, audio_params
+        y = y * 1 / max_vol    # ISSUE #15: Comment on same line as code - y, sr, hop_length, n_mels, n_fft, audio_params
+        max_vol = np.max(np.abs(y))
+        
+        if max_vol > 0 and np.isfinite(max_vol):
+            y = y / max_vol
+        
         image = compute_melspec(y, sr, hop_length, n_mels, n_fft, audio_params)
         image = prep_image.prep(image=image)['image']
         image_dict[index] = image
@@ -216,7 +291,7 @@ def get_images(audio_path, #PathLib Path object
     return image_dict, extra_specs  #a dict of images, with keys from 0 to 47 for the case of a 240 second clip.
 
 
-def mono_to_color(X, eps=1e-6, use_deltas=False):
+def mono_to_color(X: np.ndarray, eps: float = 1e-6, use_deltas: bool = False) -> np.ndarray:
     _min, _max = X.min(), X.max()
     if (_max - _min) > eps:
         X = (X - _min) / (_max - _min) #scales to a range of [0,1]
@@ -236,7 +311,7 @@ def mono_to_color(X, eps=1e-6, use_deltas=False):
     return X
 
 
-def crop_or_pad(y, length, train='train'):
+def crop_or_pad(y: np.ndarray, length: int, train: str = 'train') -> np.ndarray:
     y = np.concatenate([y, y, y])
     if len(y) <= length:
         y = np.concatenate([y, np.zeros(length - len(y))])
@@ -250,11 +325,11 @@ def crop_or_pad(y, length, train='train'):
 
 
 class AudioTransform:
-    def __init__(self, always_apply=False, p=0.5):
+    def __init__(self, always_apply: bool = False, p: float = 0.5):
         self.always_apply = always_apply
         self.p = p
 
-    def __call__(self, y: np.ndarray, sr):
+    def __call__(self, y: np.ndarray, sr: int) -> np.ndarray:
         if self.always_apply:
             return self.apply(y, sr=sr)
         else:
@@ -268,14 +343,15 @@ class AudioTransform:
     
     
 class Normalize(AudioTransform):
-    def __init__(self, always_apply=False, p=1):
+    def __init__(self, always_apply: bool = False, p: float = 1):
         super().__init__(always_apply, p)
 
-    def apply(self, y: np.ndarray, **params):
+    def apply(self, y: np.ndarray, **params: Any) -> np.ndarray:
         max_vol = np.abs(y).max()
         y_vol = y * 1 / max_vol
         return np.asfortranarray(y_vol)
-    
+
+
 
 class AbluTransforms():
     mean = (0.485, 0.456, 0.406) # RGB
@@ -289,25 +365,62 @@ class AbluTransforms():
                         A.CenterCrop(width=self.width, height=self.height),
                         A.Normalize(self.mean, self.std, max_pixel_value=1.0,always_apply=True),
                         ])
-        
+        self.train = A.Compose([
+                        A.CoarseDropout(max_holes=4, p=0.4, max_height=32, max_width=32),
+                        A.PadIfNeeded(min_height=self.width, min_width=self.width),
+                        A.CenterCrop(width=self.width, height=self.height), 
+                        A.Normalize(self.mean, self.std, max_pixel_value=1.0, always_apply=True),  
+                        ])
+
+
+def spec_augment(spec: np.ndarray, 
+                 num_mask: int = 3, 
+                 freq_masking_max_percentage: float = 0.1,
+                 time_masking_max_percentage: float = 0.1, 
+                 p: float = 0.5) -> np.ndarray:
+    if random.uniform(0, 1) > p:
+        return spec
+
+    # frequency masking
+    num_freq_masks = random.randint(1, num_mask)
+    for i in range(num_freq_masks):
+        freq_percentage = random.uniform(0, freq_masking_max_percentage)
+        freq_mask_size = int(freq_percentage * spec.shape[0])
+        freq_mask_pos = random.randint(0, spec.shape[0] - freq_mask_size)
+        spec[freq_mask_pos:freq_mask_pos+freq_mask_size, :] = 0
+
+    # time masking
+    num_time_masks = random.randint(1, num_mask)
+    for i in range(num_time_masks):
+        time_percentage = random.uniform(0, time_masking_max_percentage)
+        time_mask_size = int(time_percentage * spec.shape[1])
+        time_mask_pos = random.randint(0, spec.shape[1] - time_mask_size)
+        spec[:, time_mask_pos:time_mask_pos+time_mask_size] = 0
+
+    return spec
+
 
 class ImageDataset(Dataset):
-    def __init__(self, image_dict, image_shape, use_deltas): #, model_args
+    def __init__(self, image_dict, image_shape, use_deltas, train=False): #, model_args
         self.image_dict = image_dict
         self.image_shape = image_shape
         self.image_pixels = self.image_dict[0].shape
         self.height = self.image_shape[0] * self.image_pixels[0]  #Shape of the combined image from one __get_item__
-        self.width = self.image_shape[1] * self.image_pixels[1] 
-        self.image_transform = AbluTransforms(height=self.height, width=self.width).valid
+        self.width = self.image_shape[1] * self.image_pixels[1]
+        self.train = train
+        if not self.train:
+            self.image_transform = AbluTransforms(height=self.height, width=self.width).valid
+        else:
+            self.image_transform = AbluTransforms(height=self.height, width=self.width).train
         self.use_deltas = use_deltas
-        self.chunks_per_image = self.image_shape[0] * self.image_shape[1]
+        self.chunks_per_image = int(self.image_shape[0] * self.image_shape[1])
                
-    def __len__(self):
+    def __len__(self) -> int:
         whole = len(self.image_dict) // self.chunks_per_image
         remainder =  1 if len(self.image_dict) % self.chunks_per_image != 0 else 0
         return  whole + remainder
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         base = idx * self.chunks_per_image
         chunk_idxs = [base + n for n in range(self.chunks_per_image)]
         images = [self.image_dict[img_id] for img_id in chunk_idxs]
@@ -321,119 +434,139 @@ class ImageDataset(Dataset):
             image = np.vstack((images[0], images[1]))
         elif self.image_shape == (1,4):
             image = np.hstack((images[0], images[1], images[2], images[3]))
+        elif self.image_shape == (2,0.5):
+            half = images[0].shape[1]//2
+            left = images[0][:, :half]     # First half of columns (128, 256)
+            right = images[0][:, half:]    # Second half of columns (128, 256)
+            image = np.vstack([left, right])  # Shape becomes (256, 256)
         else:
             image = images[0]
+        if self.train:
+            image = spec_augment(image, 
+                                    p=0.25, 
+                                    num_mask=3,
+                                    freq_masking_max_percentage=0.1,
+                                    time_masking_max_percentage=0.1)
 
         image = mono_to_color(image, use_deltas=self.use_deltas)
-        image = self.image_transform(image=image)['image']
+        image = self.image_transform(image=image)['image']  #To be exactly equivalent, this should be applied globally like this, not per chunk.
         image = image.transpose(2,0,1).astype(np.float32) # swapping the image channels to the first axis
         return image, idx
-    
+
+
+class ClassifierHead(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, dropout_rate=0.2):
+        super().__init__()
+        self.linear = nn.Linear(in_channels, in_channels // 2)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.output = nn.Linear(in_channels // 2, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:          # [Batch, Chanels, Time]
+        x = x.permute(0, 2, 1)     # [Batch,  Time, Chanels,]
+        x = self.linear(x)    
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.output(x)
+        x = x.permute(0, 2, 1)      # [B, num_classes, T]
+        return x
+
 
 class BirdSoundModel(pl.LightningModule):
 
-    def init_layer(self, layer):
+    def init_layer(self, layer: nn.Module) -> None:
         nn.init.xavier_uniform_(layer.weight)
         if hasattr(layer, "bias"):
             if layer.bias is not None:
                 layer.bias.data.fill_(0.)
 
-    def init_bn(self, bn):
+    def init_bn(self, bn: nn.BatchNorm2d) -> None:
         bn.bias.data.fill_(0.)
         bn.weight.data.fill_(1.0)
         
-    def init_weight(self):
+    def init_weight(self) -> None:
         self.init_bn(self.bn0)
         self.init_layer(self.fc1)
+
 
 
     class AttentionBlock(nn.Module):
         def __init__(self,
                      in_features: int,
                      out_features: int,
-                     shape:tuple,
                      activation="linear",
-                     aggregation='mean',
-                    ):
+                     image_shape = (1,1),
+                     aggregation = 'mean',  #not used at the moment
+        ):
             super().__init__()
 
             self.activation = activation
+            
             self.attention = nn.Conv1d(
                 in_channels=in_features,
-                out_channels=out_features,
-                kernel_size=3,
+                out_channels=out_features,  #So we're doing per-class attention, because number of classes per sample is unknown
+                kernel_size=3, #was 1 originally, changed to 3 with good results
                 stride=1,
-                padding=1,
+                padding=1,  #was 0 originally, changed to 1 to match above
                 bias=True)
-            self.classify = nn.Conv1d(
-                in_channels=in_features,
-                out_channels=out_features,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=True)
-            self.init_weights()
-            self.chunks_high = shape[0]
-            self.chunks_wide = shape[1]
-            self.num_chunks = shape[0] * shape[1]
-            self.aggregation = aggregation
-        
-        def init_layer(self, layer): #could access the outer class init_layer method instead
+            
+            self.classify = ClassifierHead(in_channels=in_features, num_classes=out_features)
+            self.image_shape=image_shape
+            self.num_chunks = int(self.image_shape[0]*self.image_shape[1])
+
+        def init_layer(self, layer: nn.Module) -> None: #could access the outer class init_layer method instead
             nn.init.xavier_uniform_(layer.weight)
             if hasattr(layer, "bias"):
                 if layer.bias is not None:
-                    layer.bias.data.fill_(0.)
-               
-        def init_weights(self):
+                    layer.bias.data.fill_(0.)    
+            
+        def init_weights(self) -> None:
             self.init_layer(self.attention)
-            self.init_layer(self.classify)
+            #self.init_layer(self.classify)
 
-        def nonlinear_transform(self, x):
+        def nonlinear_transform(self, x: torch.Tensor) -> torch.Tensor:
             if self.activation == 'linear':
                 return x
             elif self.activation == 'sigmoid':
                 return torch.sigmoid(x)
 
-        def forward(self, x):
-            batch_size = x.shape[0]
-            split_length = x.shape[2] // self.num_chunks  #The number of segments per 5 sec time chunk
-            splits = torch.split(x, split_length, dim=2)
-            x = torch.cat(splits, dim=0)
-            
-            norm_att = torch.softmax(torch.tanh(self.attention(x)), dim=-1) / (16//split_length)  # /4 or 2 or 1 so the 16 values sum to 1
-            classify_logits = self.classify(x) 
-            logits_with_attn  = norm_att * classify_logits * self.num_chunks
-            
 
-            if self.aggregation == 'mean':
-                chunk_preds = self.nonlinear_transform(logits_with_attn.sum(dim=2, keepdim=True))
-                chunk_splits = torch.split(chunk_preds, batch_size, dim=0)
-                chunk_preds = torch.cat(chunk_splits, dim=2)
-            
-            elif self.aggregation == 'mean-max':
-                chunk_preds = self.nonlinear_transform((logits_with_attn * self.num_chunks).sum(dim=2, keepdim=True))
-                chunk_splits = torch.split(chunk_preds, batch_size, dim=0)
-                chunk_preds_mean = torch.cat(chunk_splits, dim=2)
-                
-                chunk_logits_max, _ = classify_logits.max(dim=2, keepdim=True)
-                chunk_preds_max = self.nonlinear_transform(chunk_logits_max)
-                chunk_splits = torch.split(chunk_preds, batch_size, dim=0)
-                chunk_preds = torch.cat(chunk_splits, dim=2)
-                
-                chunk_preds = (chunk_preds_mean + chunk_preds_max) / 2
-            
-            elif self.aggregation =='max':
-                chunk_logits_max, _ = classify_logits.max(dim=2, keepdim=True)
-                chunk_preds = self.nonlinear_transform(chunk_logits_max)
-                chunk_splits = torch.split(chunk_preds, batch_size, dim=0)
-                chunk_preds = torch.cat(chunk_splits, dim=2)
-            
-            chunk_preds = chunk_preds.transpose(1,2) #Putting the class predictions last
-            chunk_preds = chunk_preds.reshape(chunk_preds.shape[0]*chunk_preds.shape[1], -1)  #flatten to (num_preds,num_classes)
-                        
-            return chunk_preds
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-    
+            # x: (batch_size, n_features, n_chunks * n_segments_per_chunk)
+
+            # We can reshape to convolve only along the frequency dimension to operate on the time chunks independently. 
+            # We don't need to do this for the logits, but keeping the same form in case we want to change the activation, 
+            # or kernel size in a way that they are not independent of each other.
+
+            batch_size = x.shape[0]  # Split along the third dimension
+            split_length = x.shape[2] // self.num_chunks
+            
+            x = torch.split(x, split_length, dim=2)
+            x = torch.cat(x, dim=0)  #  (128, 1280, 4)
+            
+            attn = self.attention(x) #.squeeze(1)
+            norm_att = torch.softmax(torch.tanh(attn), dim=-1)/self.num_chunks #so that they have a mean value of 1/16 each
+            split_attn = torch.split(norm_att, batch_size, dim=0) #Put the weights back to their original shape
+            norm_att = torch.cat(split_attn, dim=2)#.unsqueeze(-1) 
+
+            seg_logits = self.classify(x)
+
+            seg_logits = F.dropout(seg_logits, p=0.3, training=self.training)
+            classify = self.nonlinear_transform(seg_logits)  #note - this is OK, because we're just doing a sigmoid, would be
+
+            split_logits = torch.split(seg_logits, batch_size, dim=0)
+            seg_logits = torch.cat(split_logits, dim=2)
+
+            split_classify = torch.split(classify, batch_size, dim=0)
+            classify = torch.cat(split_classify, dim=2)
+            
+            weighted_preds = norm_att * classify
+            preds = weighted_preds.sum(dim=-1)   
+
+            return preds
+
+
     def __init__(self, 
                  classes, 
                  kwargs,
@@ -449,10 +582,8 @@ class BirdSoundModel(pl.LightningModule):
         self.aggregation = kwargs['aggregation']
         self.classes = classes
         self.num_classes = len(classes)
-        
         self.image_width = self.image_shape[1] * self.chunk_width
-        self.bn0 = nn.BatchNorm2d(self.image_width)   #self.image_width  #why is this still 256???
-        
+        self.bn0 = nn.BatchNorm2d(3) #(self.image_width)   #self.image_width  #why is this still 256???
         self.base_model = timm.create_model(
                                     self.base_model_name, 
                                     pretrained=False, 
@@ -471,24 +602,24 @@ class BirdSoundModel(pl.LightningModule):
             in_features = self.base_model.classifier.in_features
 
         self.fc1 = nn.Linear(in_features, in_features, bias=True)
-        self.att_block = self.AttentionBlock(in_features, 
-                                            self.num_classes,
-                                            self.image_shape,
-                                            activation="sigmoid",
-                                            aggregation = self.aggregation,
-                                            )
+
+        self.att_block = self.AttentionBlock(in_features,
+                                             out_features=self.num_classes,
+                                             activation="sigmoid",
+                                             image_shape = self.image_shape,
+                                             aggregation = self.aggregation,  #currently unused?
+                                             )
         self.init_weight()
         self.val_outputs = []
         self.train_outputs = []
         self.metrics_list = []
         self.val_epoch = 0
-        
 
-    def forward(self, input_data):
+    def forward(self, input_data: torch.Tensor) -> torch.Tensor:
         x = input_data  #(batch_size, 3, frequency, time)  #This needs to match the the output of dataloader & getitem 
-        x = x.transpose(1, 3)  #(batch_size, mel_bins, time_steps, channels)
+        #x = x.transpose(1, 3)  #(batch_size, mel_bins, time_steps, channels)
         x = self.bn0(x)
-        x = x.transpose(1, 3)
+        #x = x.transpose(1, 3)
         x = self.encoder(x)  #This is the image passing through the base model  8x8 out with a 256x256 original image
         
         if self.image_shape == (2,2):  #Stack the (1,2) and (2,2) scenarios in the frequency direction
@@ -510,9 +641,19 @@ class BirdSoundModel(pl.LightningModule):
             x0 = x[:,:,:,:half]
             x1 = x[:,:,:,half:]
             x = torch.cat((x0,x1), dim=2) #For a 128x128 (2,1) image, we'd now have 8 high in frequency, 2 wide in time
+        elif self.image_shape == (2, 0.5):
+            half = x.shape[2]//2
+            x0 = x[:,:,:half,:]
+            x1 = x[:,:,half:,:]
+            x = torch.cat((x0,x1), dim=3)  #For a 256x256 (2, 0.5) this should be now 4 high in frequency, 16 wide in time
+            #print(f'concatenated shape {x.shape}')
+            #x = x.transpose()  #should be batch, features, freq
+
+        #For the (2,1) and (1,1) cases we don't need to do anything here, there is only one chunk represented along the horizontal axis.
         
         #This is the guts of the SED part.
-        x = torch.mean(x, dim=3) # Aggregate in the horizontal (time) axis, so now we've just got a 3d tensor (batch_size, n_features, freq-time chunks)       
+        dimension = 2 if self.image_shape == (2, 0.5) else 3
+        x = torch.mean(x, dim=dimension) # Aggregate in short axis, but only over each chunk, so now we've just got a 3d tensor (batch_size, n_features, freq-time chunks)       
         x = F.dropout(x, p=0.5, training=self.training)
         x = x.transpose(1, 2)
         x = F.relu_(self.fc1(x))
@@ -522,7 +663,7 @@ class BirdSoundModel(pl.LightningModule):
         chunk_preds = self.att_block(x)
         #print(chunk_preds.shape)
         return chunk_preds #(48,182) regardless of how the images were shaped
-    
+
 
 class Models:
     def __init__(self, config, model_parameters, audio_parameters):
@@ -531,11 +672,11 @@ class Models:
         self.ebirds = config.classes
         self.device = config.device
 
-    def get_model(self, idx):
+    def get_model(self, idx: int) -> 'BirdSoundModel':
         model_args = self.args_list[idx]
         path = model_args['ckpt_path']
         map_location = 'cpu' if self.device == torch.device('cpu') else 'cuda'
-        ckpt = torch.load(path, map_location=map_location)
+        ckpt = torch.load(path, map_location=map_location)  # ISSUE #1: Should specify weights_only=True for security (PyTorch 2.0+)
         model = BirdSoundModel(self.ebirds, model_args)
         model.load_state_dict(ckpt)
         model.eval()
@@ -545,25 +686,41 @@ class Models:
         return model  
     
 
-def prediction_for_clip(audio_path,
-                        model,
-                        sub_process=False):
+def prediction_for_clip(audio_path: Path,
+                        model: 'BirdSoundModel',
+                        sub_process: bool = False) -> np.ndarray:
     model_args=model.parameters
     audio_params=model.audio
-    device = model.device 
+    device = model.device
     
-    image_dict, num_extras = get_images(audio_path, model_args, audio_params)
+    image_dict, num_extras = get_images(audio_path, model_args, audio_params) #returns a dict with integers as keys
+    
     num_images = len(image_dict)
+
     dataset = ImageDataset(image_dict, model_args['image_shape'], model_args['use_deltas'])
     shape = model_args['image_shape']
     num_chunks = shape[0] * shape[1]
-    batch_size = num_images // num_chunks  #should be a whole number, because we made sure of this in the get_images
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0) 
+    #so batch_size here refers to an entire clip.  This will create strife with low-memory, and long clips.
+    batch_size = int(num_images // num_chunks)  #should be a whole number, because we made sure of this in the get_images
+    #loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0) 
+    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)  # ISSUE #5: Hard-coded batch_size=4 - should use calculated batch_size or make configurable
     
     if not sub_process:
         progress = tqdm(range(len(loader)), desc="Inferring a single soundscape")
     
     for images, _ in loader:
+
+    #    example = images[0][0]
+    #    plt.figure(figsize=(10, 4))
+    #    plt.imshow(example.cpu().numpy(), origin='lower', aspect='auto', cmap='magma')
+    #    plt.title("Mel Spectrogram")
+    #    plt.xlabel("Time")
+    #    plt.ylabel("Frequency")
+    #    plt.colorbar(label='Amplitude (dB)')
+    #    plt.tight_layout()
+    #    plt.show()
+
+
         images=images.to(device)
 
         with torch.no_grad():
@@ -579,33 +736,39 @@ def prediction_for_clip(audio_path,
 
     #Now let's lop off the last num_extras predictions, as these were made on place-holding random noise
     if num_extras:
-        batch_segment_preds = batch_segment_preds[:-num_extras, :]
+        batch_segment_preds = batch_segment_preds[:-num_extras, :]  # ISSUE #5: Inefficient array slicing - creates new array
 
     return batch_segment_preds
 
 
-def process_clip(audio_path, model):
+def process_clip(audio_path: Path, model: 'BirdSoundModel') -> Tuple[List[np.ndarray], List[str], List[str]]:
     clip_preds = []
-    final_row_ids = []
+    #final_row_ids = []
     batch_preds = prediction_for_clip(audio_path,
                                       model,
                                       sub_process=True)
-    
+    #returns a numpy array of length (180 x num_classes)
+
     num_preds = batch_preds.shape[0]
     
-    for idx in range(num_preds):
+    for idx in range(num_preds):  # ISSUE #5: Unnecessary list building - can use batch_preds.tolist() directly
         row = batch_preds[idx]
         clip_preds.append(row)
+
+    row_ids = [f"{audio_path.with_suffix('')}_{end}".replace("\\", "/") 
+           for end in range(5, (num_preds+1)*5, 5)]
     
-    row_ids = [audio_path.stem + f'_{end}' for end in range(5, (num_preds+1)*5, 5)]
-    final_row_ids.extend(row_ids)
+    file_paths = [str(audio_path).replace('\\', '/')] * num_preds
 
-    return clip_preds, final_row_ids
+    return clip_preds, row_ids, file_paths
 
 
-def inference(test_audios, models, model_idx, cores=1):
+def inference(test_audios: List[Path], models: 'Models', model_idx: int, cores: int = 1) -> pd.DataFrame:
     bird_list = models.ebirds
     model = models.get_model(model_idx)
+
+
+    print
     results = Parallel(n_jobs=cores, backend='threading')(
         delayed(process_clip)(audio_path, model=model) for audio_path in tqdm(test_audios, desc="Overall File List")
         )
@@ -616,31 +779,29 @@ def inference(test_audios, models, model_idx, cores=1):
 
     clip_preds = [result[0] for result in results]      #This should be a list of 1 x num_classes arrays, with a length = the number of predictions
     final_row_ids = [result[1] for result in results]   #This should be a list of row id's?
+    file_paths = [result[2] for result in results]
 
     clip_preds = [item for sublist in clip_preds for item in sublist]
     final_row_ids = [item for sublist in final_row_ids for item in sublist]
+    file_paths = [item for sublist in file_paths for item in sublist]
     prediction_df = pd.DataFrame(clip_preds, columns=bird_list)
     prediction_df.insert(0, 'row_id', final_row_ids)
+    prediction_df.insert(1, 'File_Path', file_paths)
     
     return prediction_df
 
 
 class DeriveResults():
-    def format_predictions(self, df, paths_list):
-        file_map = {re.sub(r'_\d+\..*$', '', Path(fp).stem): fp for fp in paths_list}
-        df['root'] = df['row_id'].str.replace(r'_\d+$', '', regex=True)
-        df['filepath'] = df['root'].map(file_map)
-        df.drop(columns=['root'], inplace=True)
-        return df
-
-    def __init__(self, predictions, paths_list, save_folder):
-        self.predictions = self.format_predictions(predictions, paths_list)
+    def __init__(self, predictions, save_folder):
+        self.predictions = predictions
         self.save_folder = save_folder
         self.chosen_birds = {}
+        print('from inside DeriveResults')
+        print(self.predictions.head())
 
-    def summarise(self, df):
+    def summarise(self, df: pd.DataFrame) -> pd.DataFrame:
         def _summarise(group):
-            group.drop(columns=['row_id'], inplace=True)
+            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view
             group = group.loc[:, (group == 1).any()]
             duration_seconds = len(group) * 5
             remaining_columns = group.columns
@@ -659,11 +820,11 @@ class DeriveResults():
             })
             return summary
 
-        grouped = df.groupby('filepath')
+        grouped = df.groupby('File_Path')
         summary_df = grouped.apply(_summarise, include_groups=False).reset_index(drop=False)
         return summary_df
     
-    def summarise_one_bird(self, df, bird_name):
+    def summarise_one_bird(self, df: pd.DataFrame, bird_name: str) -> pd.DataFrame:
         def _process_detections(group):
             end_time = group['time'].iloc[-1]   #get from row_id, rather than assume a row time length
             group = group.reset_index(drop=True)
@@ -692,61 +853,61 @@ class DeriveResults():
 
             return series
 
-        df = df[['filepath', 'row_id', bird_name]].copy()
+        df = df[['File_Path', 'row_id', bird_name]].copy()
         df['time'] = df['row_id'].str.extract(r'_(\d+)$').astype(int)
-        grouped = df.groupby('filepath')
+        grouped = df.groupby('File_Path')
         df = grouped.apply(_process_detections, include_groups=False).reset_index(drop=False)       
         return df
 
-    def first_detected(self, df):
+    def first_detected(self, df: pd.DataFrame) -> pd.DataFrame:
         def _first_detected(group):
-            group.drop(columns=['row_id'], inplace=True) 
+            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
             group = group.reset_index(drop=True)
             first_non_zero = group.apply(lambda col: col.ne(0).idxmax()*5 if col.ne(0).any() else np.nan)
             return first_non_zero
-        grouped = df.groupby('filepath')
+        grouped = df.groupby('File_Path')
         first_bird = grouped.apply(_first_detected, include_groups=False).reset_index(drop=False)
         columns_to_convert = list(first_bird.columns[1:])
         first_bird.loc[:,columns_to_convert] = first_bird[columns_to_convert]#.astype(pd.Int64Dtype())
         return first_bird
 
-    def last_detected(self, df):
+    def last_detected(self, df: pd.DataFrame) -> pd.DataFrame:
         def _last_detected(group):
-            group.drop(columns=['row_id'], inplace=True) 
+            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
             group = group.reset_index(drop=True)
             length = len(group) * 5
             last_non_zero = group.apply(lambda col: length - (col[::-1].ne(0).idxmax()) * 5 if col.ne(0).any() else np.nan)
             return last_non_zero
-        grouped = df.groupby('filepath')
+        grouped = df.groupby('File_Path')
         last_bird = grouped.apply(_last_detected, include_groups=False).reset_index(drop=False)
         columns_to_convert = list(last_bird.columns[1:])
         last_bird.loc[:,columns_to_convert] = last_bird[columns_to_convert]#.astype(pd.Int64Dtype())
         return last_bird
 
-    def detections_per_minute(self, df):
+    def detections_per_minute(self, df: pd.DataFrame) -> pd.DataFrame:
         def _detections_per_minute(group):
-            group.drop(columns=['row_id'], inplace=True) 
+            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
             group = group.reset_index(drop=True)
             minutes = len(group) / 12
             column_sums = group.sum(axis=0).astype(int)
             bird_rate = column_sums / minutes
             bird_rates = pd.Series(bird_rate, index=group.columns).round(3).astype('float32')
             return bird_rates
-        grouped = df.groupby('filepath')
+        grouped = df.groupby('File_Path')
         bird_rate = grouped.apply(_detections_per_minute, include_groups=False).reset_index(drop=False) 
         return bird_rate
     
-    def summarise_chosen_birds(self, birds_to_summarise):
+    def summarise_chosen_birds(self, birds_to_summarise: List[str]) -> None:
         for bird in birds_to_summarise:
             self.chosen_birds[bird]=self.summarise_one_bird(self.predictions, bird)
- 
-    def derive_results(self):
+
+    def derive_results(self) -> None:
         self.summary = self.summarise(self.predictions)
         self.first_bird = self.first_detected(self.predictions)
         self.last_bird = self.last_detected(self.predictions)
         self.bird_rate = self.detections_per_minute(self.predictions)
 
-    def save_results(self, save_folder=None):
+    def save_results(self, save_folder: Optional[Union[Path, str]] = None) -> None:
         save_folder = save_folder if save_folder is not None else self.save_folder
         save_folder = Path(save_folder) if not isinstance(save_folder, Path) else save_folder
         self.summary.to_csv(save_folder / 'detection_summary.csv', index=False)
@@ -758,7 +919,7 @@ class DeriveResults():
                 bird_no_spaces = bird.replace(" ", "_")
                 summary.to_csv(save_folder / f"{bird_no_spaces}_summary.csv", index=False)
 
-    def print_results(self):
+    def print_results(self) -> None:
         print(Colour.S + '\nThe summary dataframe' + Colour.E)
         print(self.summary.iloc[:3,:8])
         print(Colour.S + '\nThe first detection time for each species (s)' + Colour.E)
@@ -768,7 +929,7 @@ class DeriveResults():
         print(Colour.S + '\nThe detection rate, bird per minute for each species' + Colour.E)
         print(self.bird_rate.iloc[:3,:8])
 
-def merge_classes(df, ebirds, short_names):
+def merge_classes(df: pd.DataFrame, ebirds: List[str], short_names: List[str]) -> pd.DataFrame:
     name_df = pd.DataFrame({'ebirds': ebirds, 'short_name': short_names})
     mergers = name_df.groupby('short_name').agg({'ebirds': list})
     merger_dict = mergers['ebirds'].to_dict()
@@ -783,6 +944,7 @@ def merge_classes(df, ebirds, short_names):
         merged_preds[name] = np.any(merging_pred_vals, axis=1).astype(int)
         merged_df = pd.DataFrame(merged_preds)
         merged_df['row_id'] = df['row_id']
+        merged_df['File_Path'] = df['File_Path']
         cols = ['row_id'] + [col for col in merged_df.columns if col != 'row_id']
         merged_df = merged_df[cols]
     return merged_df
@@ -791,7 +953,7 @@ def merge_classes(df, ebirds, short_names):
 ############################################# Main Function  #####################################
 ##################################################################################################
 
-def infer_soundscapes(use_case):
+def infer_soundscapes(use_case: Dict[str, Any]) -> None:
     audio = AudioParameters()
     paths = FilePaths(options=use_case)
     bird_map_df = pd.read_csv(paths.bird_list_path)
@@ -806,12 +968,12 @@ def infer_soundscapes(use_case):
     naming_scheme = use_case['naming_scheme']
     threshold = use_case['threshold']
     
-    def _return_same(x):
+    def _return_same(x: str) -> str:
         return x  
     _naming_methods = {'Short':_return_same, 
-                        'Long':birdnames.common_name, 
-                        'Scientific':birdnames.scientific_name, 
-                        'eBird':_return_same}
+                       'Long':birdnames.common_name, 
+                       'Scientific':birdnames.scientific_name, 
+                       'eBird':_return_same}
     naming_method = _naming_methods[naming_scheme]
 
     print('The inference folder is:', paths.soundscapes_folder)
@@ -826,7 +988,7 @@ def infer_soundscapes(use_case):
         df = inference(paths.soundscapes, models, idx, cores=cfg.CORES)
         prediction_dfs.append(df)
 
-    prediction_columns = prediction_dfs[0].columns[1:]
+    prediction_columns = prediction_dfs[0].columns[2:]
     values_list = [df[prediction_columns].values for df in prediction_dfs]
     average_vals = np.zeros_like(values_list[0])
 
@@ -836,14 +998,18 @@ def infer_soundscapes(use_case):
     average_vals = average_vals / len(values_list)
 
     #Deal with the various naming schemes, & thresholding
-    renaming_dict = {col_name:naming_method(col_name) for col_name in prediction_columns}
-    predictions = pd.DataFrame(data=average_vals, columns=prediction_columns)
+    final_names = [naming_method(col_name) for col_name in prediction_columns]
+
+    predictions = pd.DataFrame(data=average_vals, columns=final_names)
     predictions.insert(0, 'row_id', prediction_dfs[0]['row_id']) 
+    predictions.insert(0, 'File_Path', prediction_dfs[0]['File_Path']) 
 
     print(Colour.S + 'Raw prediction scores for the first 8 birds' + Colour.E)
+    pd.set_option("display.max_colwidth", None)
     print(predictions.iloc[:5, :8])
-    predictions.to_csv(paths.predictions / 'prediction_probabilities_ebird.csv', index=False)
-    predictions.iloc[:,1:] = (predictions.iloc[:,1:] > threshold).astype(int)
+
+    predictions.to_csv(paths.predictions / 'prediction_probabilities.csv', index=False)
+    predictions.iloc[:,2:] = (predictions.iloc[:,2:] > threshold).astype(int)
 
     print(Colour.S + 'Thresholded scores for the first 8 birds' + Colour.E)
     print(predictions.iloc[:5, :8])
@@ -851,15 +1017,12 @@ def infer_soundscapes(use_case):
     if naming_scheme == 'Short':
         short_names  = birdnames.extra_names(birdnames.bird_list)  #we need to do this way for the one-many relationship
         predictions = merge_classes(predictions, birdnames.bird_list, short_names)
+
         print(Colour.S + 'Merged scores for the first 8 birds' + Colour.E)
         print(predictions.iloc[:5, :8])
 
-    predictions.rename(columns=renaming_dict, inplace=True)
-    predictions.to_csv(paths.predictions / 'binary_predictions_renamed.csv', index=False)
-
     #Derive various alternative data represenations
-    post_processor = DeriveResults(predictions, 
-                                   paths_list=paths.soundscapes, 
+    post_processor = DeriveResults(predictions,  
                                    save_folder=paths.predictions,
                                    )
     post_processor.derive_results()
@@ -875,17 +1038,18 @@ def infer_soundscapes(use_case):
 if __name__ == '__main__':
     #Default options for running during development
     options = {
-                'project_root': 'D:\Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
+                'project_root': '/home/olly/Desktop/Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
                 'experiment': None, #None to use what ever is in the Models folder, otherwise an integer for the experiment number
-                'threshold': 0.2,
-                'folder_to_process': 'D:/Kaytoo/Data/Soundscapes/debugging',
-                'results_folder': 'D:/Kaytoo/Data/Predictions',
-                'naming_scheme' : 'Scientific', #'Short, Long, Scientific, eBird'
+                'threshold': 0.3,
+                #'folder_to_process': '/home/olly/Desktop/Kaytoo/data/more_corrupt_files',# 'D:/Kaytoo/Data/Corrupt_Files', #'D:/Kaytoo/Data/Soundscapes/debugging',
+                'folder_to_process':'/home/olly/Desktop/Kaytoo/data/corrupt_files',
+                'results_folder': '/home/olly/Desktop/Kaytoo/predictions',
+                'naming_scheme' : 'Short', #'Scientific', #'Short, Long, Scientific, eBird'
                 'cpu_only': False,
                 'num_cores': 1,  #Can crank this up if using CPU only.
-                'birds_to_summarise':['Chlidonias albostriatus']  #['Australian Magpie'],  Black-fronted Tern blfter1	Chlidonias albostriatus	Tern
+                'birds_to_summarise':['Spotted Kiwi'], #['Chlidonias albostriatus']  #['Australian Magpie'],  Black-fronted Tern blfter1	Chlidonias albostriatus	Tern
                 }
-
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--project_root", type=str, default=None, help="Filepath to the root directory (parent of the 'Python' folder)")
     parser.add_argument("--experiment", type=str, default=None, help="An integer for the experiment number, or None to models from /Models")
@@ -893,7 +1057,7 @@ if __name__ == '__main__':
     parser.add_argument("--folder_to_process", type=str, default=None, help="path to the processing folder, relative to the project root")
     parser.add_argument("--results_folder", type=str, default=None, help="Folder to put the predictions")
     parser.add_argument("--naming_scheme", type=str, default=None, help="A string that must be one of: 'Long', 'Short', 'eBird', 'Scientific'")
-    parser.add_argument("--cpu_only", type=bool, default=None, help="Force to process the audio files with CPU if you don't have an NVIDIA GPU with sufficent memory")
+    parser.add_argument("--cpu_only", type=bool, default=None, help="Force to process the audio files with CPU if you don't have an NVIDIA GPU with sufficent memory")  # ISSUE #14: Boolean argument parsing is incorrect - should use action='store_true'
     parser.add_argument("--num_cores", type=int, default=None, help="Number of CPU cores.  The more the better, but it may crash your system")
     parser.add_argument("--birds_to_summarise", type=str, default=None, help="A string as a list of strings matching birds that need individual summary files")
     args = parser.parse_args()
@@ -905,5 +1069,4 @@ if __name__ == '__main__':
                 options[key] = ast.literal_eval(value)
             else:
                 options[key] = value
-    
     infer_soundscapes(options)
