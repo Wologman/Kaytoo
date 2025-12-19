@@ -10,25 +10,22 @@ import librosa
 from scipy.signal import resample
 from torchaudio.functional import compute_deltas
 from torch.utils.data import Dataset
-import pytorch_lightning as pl
-import torch.nn.functional as F
-import timm
 import torch.nn as nn
 from joblib import Parallel, delayed
 import multiprocessing
 multiprocessing.freeze_support()
 from tqdm import tqdm
 import pandas as pd
-from torch.utils.data import  DataLoader  # ISSUE #15: Extra space in import
+from torch.utils.data import DataLoader
 from bird_naming_utils import BirdNamer
 from pathlib import Path
-import re  # ISSUE #11: Unused import - remove if not needed
 import argparse
 import yaml
 import random
 import ast
-import matplotlib.pyplot as plt  # ISSUE #11: Unused import - only used in commented code
 from test_cuda import test_cuda
+from kaytoo_sed_model import BirdSoundModel
+from kaytoo_processes import PrepareSpec, wav_to_bw_image, mono_to_color
 
 ############################################# Parameters  ######################################
 ##################################################################################################
@@ -46,7 +43,7 @@ class DefaultConfig:
                 if gpu:
                     device_name = torch.cuda.get_device_name(torch.cuda.current_device())
                     print("Using GPU:", device_name)
-                    self.device = torch.device(device)
+                self.device = torch.device(device)
             if options['num_cores']:
                 self.CORES = options['num_cores']
             else:
@@ -56,19 +53,34 @@ class DefaultConfig:
             device, gpu = test_cuda()
             self.naming = 'eBird'
             self.device = torch.device(device)
-            self.cores = os.cpu_count()//2 or 1
+            self.cores = (os.cpu_count() or 2)//2
 
 
 class AudioParameters:
-    def __init__(self):
+    def __init__(self, model_parameters):
+        self.IMAGE_SHAPE = model_parameters['image_shape']  #Tpyical (2,.5)  For 12 seconds with buffer around one
+        self.IMAGE_TIME = model_parameters['image_time']
         self.SR = 32000
+        self.SPEC_WIDTH = model_parameters['spec_width']    #Typical 768
+        self.IMAGE_WIDTH = int(model_parameters['image_shape'][1] * self.SPEC_WIDTH)  #Typical 384
+        self.DOUBLE_AUDIO = model_parameters['double_audio']
+        self.BUFFER_AUDIO = 1
+        self.N_MELS = model_parameters['n_mels']  #Typical 192 (384/2)
+        self.N_FFT = model_parameters['n_fft']
         self.FMIN = 20
-        self.FMAX = 14000 
+        self.FMAX = 14000
+        self.HOP_LENGTH = model_parameters['hop_length']
+        self.PCEN = False
+        self.USE_DELTAS = model_parameters['use_deltas']
+
+    def __str__(self):
+        lines = [f"{k}: {v}" for k, v in vars(self).items()]
+        return "\n".join(lines)
 
 
 class FilePaths:
     AUDIO_TYPES = {'.ogg','.wav', '.flac', '.mp3'}
-    def __init__(self, options=None):
+    def __init__(self, options: dict):
         self.root_folder = Path(options['project_root'])  # ISSUE #1: No validation that paths exist or are accessible
         self.models_folder = self.root_folder / 'models'
         self.data_folder = self.root_folder / 'data'
@@ -80,7 +92,7 @@ class FilePaths:
 
 
 class ModelParameters:
-   def __init__(self, options=None):  # ISSUE #15: Inconsistent indentation (3 spaces vs 4)
+    def __init__(self, options: dict):
         '''
         _parameters_list = [
                             {'basename':'tf_efficientnet_b0.ns_jft_in1k', 
@@ -95,27 +107,33 @@ class ModelParameters:
                                             'hop_length': 1243,
                                             '5_sec_width': 128,
                                             'aggregation': 'mean',
+                                            'pcen': False
                                             }, 
                             ] 
         '''
         if options['experiment'] is not None:
             _deploy_fldr = f"{options['project_root']}/data/experiments/exp_{options['experiment']}/exp_{options['experiment']}_deploy"
+            last_ckpt =  Path(f"{options['project_root']}/data/experiments/exp_{options['experiment']}") / 'temp/checkpoints/last.ckpt'
             _deploy_folders = [Path(_deploy_fldr)]
         else:
+            last_ckpt  = None
             _models_dir = Path(f"{options['project_root']}/models/")
             _deploy_folders = [subdir for subdir in _models_dir.iterdir() if subdir.is_dir() and subdir.name.endswith('_deploy')]
             
         self.parameters = []
         for model_fldr in _deploy_folders:
-            ckpt_files = list(model_fldr.glob("*.ckpt"))
+            print(f'Checking {model_fldr} for models...')
+            pt_files = list(model_fldr.glob("*.pt"))
             cfg_files = list(model_fldr.glob("*.yaml"))
-            if ckpt_files:
-                latest_ckpt = max(ckpt_files, key=lambda f: f.stat().st_mtime)  #There should only be one  
+            if pt_files:
+                latest_pt = max(pt_files, key=lambda f: f.stat().st_mtime)  #There should only be one  
                 if cfg_files:
                     latest_cfg = max(cfg_files, key=lambda f: f.stat().st_mtime)  #There should only be one
                     with open(latest_cfg, "r") as f:
                         model_config = yaml.load(f, Loader=yaml.FullLoader)  # Using FullLoader to support Python tuples in YAML (safer than default loader)
-                        model_config['ckpt_path'] = latest_ckpt
+                        model_config['pt_path'] = latest_pt
+                        model_config['pcen'] = False
+                        model_config['ckpt_path'] = last_ckpt
                         self.parameters.append(model_config)
                 else:
                     print(f'Warning: No configuration file was found in {str(model_fldr)}')  # ISSUE #9: Use logging instead of print
@@ -128,7 +146,7 @@ class Colour:
     E = '\033[0m'
 
 
-def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 10) -> np.ndarray:
+def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 5) -> np.ndarray:
     """Open an audio clip and ensure it is a valid, finite 1D numpy array.
     On error or invalid input, replaces with random noise.
     """
@@ -152,13 +170,6 @@ def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 10)
         print(f"[WARN] Invalid (NaN/Inf) values found in {path}, replaced with zeros.")
         y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Normalize safely (avoid divide by zero)
-    max_val = np.max(np.abs(y))
-    if max_val == 0 or not np.isfinite(max_val):
-        print(f"[WARN] Zero or invalid max value in {path}, skipping normalization.")
-    else:
-        y = y / max_val
-
     # Resample if needed
     if sr != default_sr:
         num_samples = int(len(y) * default_sr / sr)
@@ -166,9 +177,9 @@ def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 10)
         sr = default_sr
 
     # Pad or trim to at least `min_duration` seconds
-    required_samples = int(min_duration * default_sr)
-    if len(y) < required_samples:
-        pad_len = required_samples - len(y)
+    min_samples = int(min_duration * default_sr)
+    if len(y) < min_samples:
+        pad_len = min_samples - len(y)
         y = np.concatenate([y, np.random.randn(pad_len)])
         print(f"[INFO] Padded {path} to {len(y)/default_sr:.1f} s")
 
@@ -176,8 +187,13 @@ def open_audio_clip(path: Path, default_sr: int = 32000, min_duration: int = 10)
     return y
 
 
-
-def compute_melspec(y: np.ndarray, sr: int, hop_length: int, n_mels: int, n_fft: int, audio_params: Optional[AudioParameters]) -> np.ndarray:
+def compute_melspec(y: np.ndarray,
+                    sr: int,
+                    hop_length: int,
+                    n_mels: int,
+                    n_fft: int,
+                    audio_params: Optional[AudioParameters],
+                    ) -> np.ndarray:
     if audio_params:
         fmin = audio_params.FMIN
         fmax = audio_params.FMAX
@@ -196,17 +212,6 @@ def compute_melspec(y: np.ndarray, sr: int, hop_length: int, n_mels: int, n_fft:
     return librosa.power_to_db(melspec)
 
 
-class PrepareImage():
-    mean = .5
-    std = .22
-    def __init__(self, height, width):
-        self.height = height
-        self.width = width
-        self.prep = A.Compose([
-            A.PadIfNeeded(min_height=self.height, min_width=self.width),
-            A.CenterCrop(width=self.width, height=self.height),
-            A.Normalize(mean=self.mean, std=self.std, max_pixel_value=1.0, always_apply=True),
-        ])
 
 
 def get_images(audio_path: Path,
@@ -215,44 +220,52 @@ def get_images(audio_path: Path,
                clip_length: Optional[int] = None,
                sr: int = 32000) -> Tuple[Dict[int, np.ndarray], int]:
     
-    double = model_params['double_audio']
-    buffer = model_params['buffer_audio'] * sr
+    double = audio_params.DOUBLE_AUDIO
+    buffer_sec = audio_params.BUFFER_AUDIO
+    buffer = int(buffer_sec * sr)
     trim = abs(buffer)
-    hop_length = model_params['hop_length']
-    n_mels = model_params['n_mels']
-    n_fft = model_params['n_fft']
-    chunk_width = model_params['5_sec_width']
+    n_mels = audio_params.N_MELS
+    spec_width = audio_params.SPEC_WIDTH  #Could be 2x the image width for the doubled audio scenario
+    preparer = PrepareSpec(height=n_mels, width = spec_width)
     num_chunks = model_params['image_shape'][0] * model_params['image_shape'][1]
+    image_time = audio_params.IMAGE_TIME
     
-    if model_params['double_audio']:  #note that buffer_audio can be < 0
-        chunk_length = int(((model_params['image_time']-2*model_params['buffer_audio'])/2)//num_chunks)
+    if double:  #note that buffer_audio can be < 0
+        chunk_length_sec = int(((image_time - 2 * buffer_sec) / 2) / num_chunks)  #eg (12 - 2*1)/2 / 1  = 5 (seconds)  To chunk the original clip into 5 secs
     else:
-        chunk_length = int((model_params['image_time']-2*model_params['buffer_audio'])//(num_chunks))
-    
-    prep_image = PrepareImage(height=n_mels, width=chunk_width)
+        chunk_length_sec = int((image_time-2*buffer_sec)/ num_chunks)
 
     idxs  = []
     image_dict = {}
-    _y = open_audio_clip(audio_path)
+    _y = open_audio_clip(audio_path, default_sr=sr) #resamples if needed to ensure sr = sr
     if clip_length is None:
         clip_length = len(_y) // sr
 
+    total_chunks = int(clip_length // chunk_length_sec)
+    
+    #Let's ensure that _y is a whole number of chunks
+    chunk_len_samples = int(chunk_length_sec * sr)
+    n_samples = len(_y)
+    remainder = n_samples % chunk_len_samples
 
-    print("clip_length (sec):", clip_length)
-    print("chunk_length (sec):", chunk_length)
-    print("loop iterations:", int(clip_length) // chunk_length)
+    if remainder != 0:
+        pad_len = chunk_len_samples - remainder
+        last_chunk = _y[-remainder:]
+        reps = int(np.ceil(pad_len / remainder))
+        pad = np.tile(last_chunk, reps)[:pad_len]
+        _y = np.concatenate([_y, pad])
 
-    for index in range(0, int(clip_length) // chunk_length):
+    for index in range(0, total_chunks):
         idxs.append(index)
-        start = index * chunk_length
-        stop = start + chunk_length
+        start = index * chunk_length_sec
+        stop = start + chunk_length_sec
         start_idx = sr * start
         stop_idx =  sr * stop
-        
+
         if double and buffer>=0:
             if index == 0:
                 y = np.concatenate((_y[:buffer], _y[:stop_idx], _y[:stop_idx + buffer]))
-            elif index == 11:  # ISSUE #6: Magic number 11 - should use total_chunks - 1 instead
+            elif index == total_chunks - 1:
                 y = np.concatenate((_y[start_idx-buffer:],  _y[start_idx:], _y[-buffer:]))
             else:
                 y = np.concatenate((_y[start_idx-buffer:stop_idx], _y[start_idx:stop_idx+buffer]))
@@ -267,48 +280,32 @@ def get_images(audio_path: Path,
                 y = np.concatenate((y, noise))
             else: 
                 y = _y[start_idx: stop_idx]
-        
-        max_vol = np.abs(y).max()
-        y = y * 1 / max_vol    # ISSUE #15: Comment on same line as code - y, sr, hop_length, n_mels, n_fft, audio_params
+
         max_vol = np.max(np.abs(y))
-        
+
         if max_vol > 0 and np.isfinite(max_vol):
             y = y / max_vol
-        
-        image = compute_melspec(y, sr, hop_length, n_mels, n_fft, audio_params)
-        image = prep_image.prep(image=image)['image']
-        image_dict[index] = image
-        
+
+        image_dict[index] = wav_to_bw_image(y,
+                                audio_cfg=audio_params,
+                                preparer=preparer
+                                )
+        #folding, transforms & mono to colour are done in the dataloader
+
     num_specs = len(image_dict)
-    extra_specs = clip_length % num_chunks  #Handle the case where there are more spectrograms needed to make up the combined image
-    if extra_specs:
-        noise = np.random.randn(chunk_length * sr)
-        image = compute_melspec(noise, sr, hop_length, n_mels, n_fft, audio_params)
-        image = prep_image.prep(image=image)['image']
+    extra_specs = total_chunks % num_chunks  #Handle the case where there are more spectrograms needed to make up the combined image
+    if extra_specs:  #For batch shape consistency
+        noise = np.random.randn(image_time * sr)
+        image = wav_to_bw_image(noise,
+                                audio_cfg=audio_params,
+                                preparer=preparer
+                                )
         for extra_idx in range(num_specs+1, num_specs+extra_specs+1):
             image_dict[extra_idx] = image
+    #Returns a dict of images, with keys from 0 to length // chunk_length (so 12 images for a 1-minute / 5-sec config)
 
-    return image_dict, extra_specs  #a dict of images, with keys from 0 to 47 for the case of a 240 second clip.
-
-
-def mono_to_color(X: np.ndarray, eps: float = 1e-6, use_deltas: bool = False) -> np.ndarray:
-    _min, _max = X.min(), X.max()
-    if (_max - _min) > eps:
-        X = (X - _min) / (_max - _min) #scales to a range of [0,1]
-        X = X.astype(np.float32)
-    else:
-        X = np.zeros_like(X, dtype=np.float32)
-    
-    if use_deltas:
-        T = torch.tensor(X, dtype=torch.float32)
-        delta = compute_deltas(T)
-        delta_2 = compute_deltas(delta)
-        delta, delta_2 = delta.numpy(), delta_2.numpy()
-        X=np.stack([X, delta, delta_2], axis=-1)
-    else:
-        X = np.stack([X, X, X], axis=-1) #puts the chanels last, like a normal image
-
-    return X
+    #So at this point it has only been normalised once, still needs scaling on [0,1], then ImageNet scaling 
+    return image_dict, extra_specs  
 
 
 def crop_or_pad(y: np.ndarray, length: int, train: str = 'train') -> np.ndarray:
@@ -349,8 +346,7 @@ class Normalize(AudioTransform):
     def apply(self, y: np.ndarray, **params: Any) -> np.ndarray:
         max_vol = np.abs(y).max()
         y_vol = y * 1 / max_vol
-        return np.asfortranarray(y_vol)
-
+        return y_vol
 
 
 class AbluTransforms():
@@ -404,7 +400,7 @@ class ImageDataset(Dataset):
     def __init__(self, image_dict, image_shape, use_deltas, train=False): #, model_args
         self.image_dict = image_dict
         self.image_shape = image_shape
-        self.image_pixels = self.image_dict[0].shape
+        self.image_pixels = self.image_dict.get(0, np.zeros((192, 768))).shape
         self.height = self.image_shape[0] * self.image_pixels[0]  #Shape of the combined image from one __get_item__
         self.width = self.image_shape[1] * self.image_pixels[1]
         self.train = train
@@ -447,9 +443,14 @@ class ImageDataset(Dataset):
                                     num_mask=3,
                                     freq_masking_max_percentage=0.1,
                                     time_masking_max_percentage=0.1)
+            
+        #print(f'before mono_to_colour but after spec_augment the min/max is {image.min()}, {image.max()}')  #Big numbers like -250, +230.  
 
-        image = mono_to_color(image, use_deltas=self.use_deltas)
+        image = mono_to_color(image, use_deltas=self.use_deltas)  #Scales onto [0,1] then computes other channels
+        #print(image.min(), image.max())
+        #print("pre-albu min/max:", image.min(), image.max())
         image = self.image_transform(image=image)['image']  #To be exactly equivalent, this should be applied globally like this, not per chunk.
+        #print("post-albu min/max:", image.min(), image.max())
         image = image.transpose(2,0,1).astype(np.float32) # swapping the image channels to the first axis
         return image, idx
 
@@ -472,288 +473,116 @@ class ClassifierHead(nn.Module):
         return x
 
 
-class BirdSoundModel(pl.LightningModule):
-
-    def init_layer(self, layer: nn.Module) -> None:
-        nn.init.xavier_uniform_(layer.weight)
-        if hasattr(layer, "bias"):
-            if layer.bias is not None:
-                layer.bias.data.fill_(0.)
-
-    def init_bn(self, bn: nn.BatchNorm2d) -> None:
-        bn.bias.data.fill_(0.)
-        bn.weight.data.fill_(1.0)
-        
-    def init_weight(self) -> None:
-        self.init_bn(self.bn0)
-        self.init_layer(self.fc1)
-
-
-
-    class AttentionBlock(nn.Module):
-        def __init__(self,
-                     in_features: int,
-                     out_features: int,
-                     activation="linear",
-                     image_shape = (1,1),
-                     aggregation = 'mean',  #not used at the moment
-        ):
-            super().__init__()
-
-            self.activation = activation
-            
-            self.attention = nn.Conv1d(
-                in_channels=in_features,
-                out_channels=out_features,  #So we're doing per-class attention, because number of classes per sample is unknown
-                kernel_size=3, #was 1 originally, changed to 3 with good results
-                stride=1,
-                padding=1,  #was 0 originally, changed to 1 to match above
-                bias=True)
-            
-            self.classify = ClassifierHead(in_channels=in_features, num_classes=out_features)
-            self.image_shape=image_shape
-            self.num_chunks = int(self.image_shape[0]*self.image_shape[1])
-
-        def init_layer(self, layer: nn.Module) -> None: #could access the outer class init_layer method instead
-            nn.init.xavier_uniform_(layer.weight)
-            if hasattr(layer, "bias"):
-                if layer.bias is not None:
-                    layer.bias.data.fill_(0.)    
-            
-        def init_weights(self) -> None:
-            self.init_layer(self.attention)
-            #self.init_layer(self.classify)
-
-        def nonlinear_transform(self, x: torch.Tensor) -> torch.Tensor:
-            if self.activation == 'linear':
-                return x
-            elif self.activation == 'sigmoid':
-                return torch.sigmoid(x)
-
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-            # x: (batch_size, n_features, n_chunks * n_segments_per_chunk)
-
-            # We can reshape to convolve only along the frequency dimension to operate on the time chunks independently. 
-            # We don't need to do this for the logits, but keeping the same form in case we want to change the activation, 
-            # or kernel size in a way that they are not independent of each other.
-
-            batch_size = x.shape[0]  # Split along the third dimension
-            split_length = x.shape[2] // self.num_chunks
-            
-            x = torch.split(x, split_length, dim=2)
-            x = torch.cat(x, dim=0)  #  (128, 1280, 4)
-            
-            attn = self.attention(x) #.squeeze(1)
-            norm_att = torch.softmax(torch.tanh(attn), dim=-1)/self.num_chunks #so that they have a mean value of 1/16 each
-            split_attn = torch.split(norm_att, batch_size, dim=0) #Put the weights back to their original shape
-            norm_att = torch.cat(split_attn, dim=2)#.unsqueeze(-1) 
-
-            seg_logits = self.classify(x)
-
-            seg_logits = F.dropout(seg_logits, p=0.3, training=self.training)
-            classify = self.nonlinear_transform(seg_logits)  #note - this is OK, because we're just doing a sigmoid, would be
-
-            split_logits = torch.split(seg_logits, batch_size, dim=0)
-            seg_logits = torch.cat(split_logits, dim=2)
-
-            split_classify = torch.split(classify, batch_size, dim=0)
-            classify = torch.cat(split_classify, dim=2)
-            
-            weighted_preds = norm_att * classify
-            preds = weighted_preds.sum(dim=-1)   
-
-            return preds
-
-
-    def __init__(self, 
-                 classes, 
-                 kwargs,
-                 in_channels=3,
-                ):
-        super().__init__()
-        
-        self.image_time = kwargs['image_time'] # The total length of time represented by one complete image
-        self.spec_height = kwargs['n_mels'] # The height of each spectrogram, before any stacking into an image
-        self.chunk_width = kwargs['5_sec_width'] # The width of each spectrogram, before any stacking into an image
-        self.image_shape = kwargs['image_shape'] # The spectrogram arrangement into an image (2,2) or (1,1) or (1,2), height x width
-        self.base_model_name = kwargs['basename']
-        self.aggregation = kwargs['aggregation']
-        self.classes = classes
-        self.num_classes = len(classes)
-        self.image_width = self.image_shape[1] * self.chunk_width
-        self.bn0 = nn.BatchNorm2d(3) #(self.image_width)   #self.image_width  #why is this still 256???
-        self.base_model = timm.create_model(
-                                    self.base_model_name, 
-                                    pretrained=False, 
-                                    in_chans=in_channels,
-                                    )
-        layers = list(self.base_model.children())[:-2]
-        self.encoder = nn.Sequential(*layers)
-
-        if hasattr(self.base_model, "fc"):
-            in_features = self.base_model.fc.in_features
-        elif self.base_model_name == 'eca_nfnet_l0':
-            in_features = self.base_model.head.fc.in_features
-        elif self.base_model_name == 'convnext_tiny.in12k_ft_in1k':
-            in_features = self.base_model.head.fc.in_features
-        else:
-            in_features = self.base_model.classifier.in_features
-
-        self.fc1 = nn.Linear(in_features, in_features, bias=True)
-
-        self.att_block = self.AttentionBlock(in_features,
-                                             out_features=self.num_classes,
-                                             activation="sigmoid",
-                                             image_shape = self.image_shape,
-                                             aggregation = self.aggregation,  #currently unused?
-                                             )
-        self.init_weight()
-        self.val_outputs = []
-        self.train_outputs = []
-        self.metrics_list = []
-        self.val_epoch = 0
-
-    def forward(self, input_data: torch.Tensor) -> torch.Tensor:
-        x = input_data  #(batch_size, 3, frequency, time)  #This needs to match the the output of dataloader & getitem 
-        #x = x.transpose(1, 3)  #(batch_size, mel_bins, time_steps, channels)
-        x = self.bn0(x)
-        #x = x.transpose(1, 3)
-        x = self.encoder(x)  #This is the image passing through the base model  8x8 out with a 256x256 original image
-        
-        if self.image_shape == (2,2):  #Stack the (1,2) and (2,2) scenarios in the frequency direction
-            half = x.shape[2]//2
-            x0 = x[:,:,:half,:half]
-            x1 = x[:,:,:half,half:]
-            x2 = x[:,:,half:,:half]
-            x3 = x[:,:,half:,half:]
-            x = torch.cat((x0,x1,x2,x3), dim=2) #stack vertically along the frequency direction, so now it's 16 high, 4 wide for a 256x256 input image
-        elif self.image_shape == (1,4):  #Stack the (1,2) and (2,2) scenarios in the frequency direction
-            quarter = x.shape[2]//4
-            x0 = x[:,:,:,:quarter]
-            x1 = x[:,:,:,quarter:2*quarter]
-            x2 = x[:,:,:,2*quarter:3*quarter]
-            x3 = x[:,:,:,3*quarter:]
-            x = torch.cat((x0,x1,x2,x3), dim=2) #stack vertically along the frequency direction, so now it's 16 high, 4 wide for a 256x256 input image
-        elif self.image_shape == (1,2):
-            half = x.shape[3]//2
-            x0 = x[:,:,:,:half]
-            x1 = x[:,:,:,half:]
-            x = torch.cat((x0,x1), dim=2) #For a 128x128 (2,1) image, we'd now have 8 high in frequency, 2 wide in time
-        elif self.image_shape == (2, 0.5):
-            half = x.shape[2]//2
-            x0 = x[:,:,:half,:]
-            x1 = x[:,:,half:,:]
-            x = torch.cat((x0,x1), dim=3)  #For a 256x256 (2, 0.5) this should be now 4 high in frequency, 16 wide in time
-            #print(f'concatenated shape {x.shape}')
-            #x = x.transpose()  #should be batch, features, freq
-
-        #For the (2,1) and (1,1) cases we don't need to do anything here, there is only one chunk represented along the horizontal axis.
-        
-        #This is the guts of the SED part.
-        dimension = 2 if self.image_shape == (2, 0.5) else 3
-        x = torch.mean(x, dim=dimension) # Aggregate in short axis, but only over each chunk, so now we've just got a 3d tensor (batch_size, n_features, freq-time chunks)       
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = x.transpose(1, 2)
-        x = F.relu_(self.fc1(x))
-        x = x.transpose(1, 2)
-        x = F.dropout(x, p=0.5, training=self.training)
-        
-        chunk_preds = self.att_block(x)
-        #print(chunk_preds.shape)
-        return chunk_preds #(48,182) regardless of how the images were shaped
-
-
 class Models:
-    def __init__(self, config, model_parameters, audio_parameters):
+    def __init__(self, config, model_parameters):
+        self.cfg = config
         self.args_list = model_parameters.parameters
-        self.audio = audio_parameters
         self.ebirds = config.classes
         self.device = config.device
 
     def get_model(self, idx: int) -> 'BirdSoundModel':
         model_args = self.args_list[idx]
-        path = model_args['ckpt_path']
         map_location = 'cpu' if self.device == torch.device('cpu') else 'cuda'
-        ckpt = torch.load(path, map_location=map_location)  # ISSUE #1: Should specify weights_only=True for security (PyTorch 2.0+)
-        model = BirdSoundModel(self.ebirds, model_args)
-        model.load_state_dict(ckpt)
+        audio_cfg = AudioParameters(model_args)
+        print(model_args['basename'])
+
+        path = model_args['pt_path']
+        print(f'Loading PyTorch from pt path: {path}')
+        model = BirdSoundModel(model_args['basename'],
+                                len(self.ebirds),
+                                model_args['image_shape'],
+                                device=self.device)
+        state_dict = torch.load(path, map_location=map_location)
+        
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
-        model.parameters = self.args_list[idx]
-        model.audio = self.audio
+        model.parameters = model_args
+        model.audio = audio_cfg
         model.to(self.device)
-        return model  
-    
+        model.device = self.device  # Ensure device attribute is set correctly
+        return model
+
 
 def prediction_for_clip(audio_path: Path,
-                        model: 'BirdSoundModel',
-                        sub_process: bool = False) -> np.ndarray:
-    model_args=model.parameters
-    audio_params=model.audio
+                        model: BirdSoundModel,
+                        sub_process: bool = False, 
+                        MAX_BATCH_SIZE: int = 12
+                        ) -> np.ndarray:
+
+    model_args = model.parameters
+    audio_params = model.audio
     device = model.device
+    num_classes = model.num_classes
     
-    image_dict, num_extras = get_images(audio_path, model_args, audio_params) #returns a dict with integers as keys
-    
+    image_dict, num_extras = get_images(audio_path, model_args, audio_params)
     num_images = len(image_dict)
 
-    dataset = ImageDataset(image_dict, model_args['image_shape'], model_args['use_deltas'])
-    shape = model_args['image_shape']
-    num_chunks = shape[0] * shape[1]
-    #so batch_size here refers to an entire clip.  This will create strife with low-memory, and long clips.
-    batch_size = int(num_images // num_chunks)  #should be a whole number, because we made sure of this in the get_images
-    #loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0) 
-    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)  # ISSUE #5: Hard-coded batch_size=4 - should use calculated batch_size or make configurable
+    #At this point the images have wide ranges like [-150, +150]  from the get_images()  Because went db scale to scaling with max_pixel=1
     
+    #Image dataset normalises onto [0,1], then the imagenet transfrom.
+    dataset = ImageDataset(
+        image_dict,
+        model_args['image_shape'],
+        model_args['use_deltas']
+    )
+
+    batch_size = min(MAX_BATCH_SIZE, num_images)
+
+    if batch_size == 0:
+        return np.zeros((0, num_classes), dtype=np.float32)
+
+    loader = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=0
+                        )
+
     if not sub_process:
-        progress = tqdm(range(len(loader)), desc="Inferring a single soundscape")
-    
-    for images, _ in loader:
+        progress = tqdm(loader, desc="Inferring a single soundscape")
+    else:
+        progress = loader
 
-    #    example = images[0][0]
-    #    plt.figure(figsize=(10, 4))
-    #    plt.imshow(example.cpu().numpy(), origin='lower', aspect='auto', cmap='magma')
-    #    plt.title("Mel Spectrogram")
-    #    plt.xlabel("Time")
-    #    plt.ylabel("Frequency")
-    #    plt.colorbar(label='Amplitude (dB)')
-    #    plt.tight_layout()
-    #    plt.show()
+    all_preds = []
 
+    with torch.no_grad():
+        for images, _ in progress:
+            images = images.to(device)
+            predictions = model(images)['clip_preds']
+            preds = predictions.detach().cpu().numpy()
+            all_preds.append(preds)
 
-        images=images.to(device)
-
-        with torch.no_grad():
-            predictions = model(images)  
-            batch_segment_preds = predictions.detach().cpu().numpy()  #batch_size x num_chunks x num_classes
-      
-        if not sub_process:
-            progress.update(1)
-
+    # free memory
     del loader, dataset, image_dict
-    if device == torch.device('cuda'):
+    if device == torch.device("cuda"):
         torch.cuda.empty_cache()
 
-    #Now let's lop off the last num_extras predictions, as these were made on place-holding random noise
+    # stack all predictions
+    all_preds = np.concatenate(all_preds, axis=0)
+
+    # remove extra padding preds
     if num_extras:
-        batch_segment_preds = batch_segment_preds[:-num_extras, :]  # ISSUE #5: Inefficient array slicing - creates new array
+        all_preds = all_preds[:-num_extras]
 
-    return batch_segment_preds
+    return all_preds
 
 
-def process_clip(audio_path: Path, model: 'BirdSoundModel') -> Tuple[List[np.ndarray], List[str], List[str]]:
-    clip_preds = []
-    #final_row_ids = []
+def process_clip(audio_path: Path,
+                 model: 'BirdSoundModel',
+                 debug=False,)-> Tuple[List[np.ndarray], List[str], List[str]]:
+
+    if debug:
+        print('\nThe model parameters:')
+        print(model.parameters)
+        print('\nThe audio parameters')
+        print(model.audio)
+
     batch_preds = prediction_for_clip(audio_path,
                                       model,
                                       sub_process=True)
-    #returns a numpy array of length (180 x num_classes)
 
     num_preds = batch_preds.shape[0]
-    
-    for idx in range(num_preds):  # ISSUE #5: Unnecessary list building - can use batch_preds.tolist() directly
-        row = batch_preds[idx]
-        clip_preds.append(row)
+    clip_preds = batch_preds.tolist()
 
     row_ids = [f"{audio_path.with_suffix('')}_{end}".replace("\\", "/") 
            for end in range(5, (num_preds+1)*5, 5)]
@@ -763,14 +592,16 @@ def process_clip(audio_path: Path, model: 'BirdSoundModel') -> Tuple[List[np.nda
     return clip_preds, row_ids, file_paths
 
 
-def inference(test_audios: List[Path], models: 'Models', model_idx: int, cores: int = 1) -> pd.DataFrame:
+def inference(test_audios: List[Path],
+              models: 'Models',
+              model_idx: int,
+              cores: int = 1,
+              debug: bool = False)-> pd.DataFrame:
     bird_list = models.ebirds
     model = models.get_model(model_idx)
 
-
-    print
     results = Parallel(n_jobs=cores, backend='threading')(
-        delayed(process_clip)(audio_path, model=model) for audio_path in tqdm(test_audios, desc="Overall File List")
+        delayed(process_clip)(audio_path, model=model, debug=debug) for audio_path in tqdm(test_audios, desc="Overall File List")
         )
     
     del model
@@ -801,12 +632,12 @@ class DeriveResults():
 
     def summarise(self, df: pd.DataFrame) -> pd.DataFrame:
         def _summarise(group):
-            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view
-            group = group.loc[:, (group == 1).any()]
-            duration_seconds = len(group) * 5
-            remaining_columns = group.columns
-            column_sums = group.sum(axis=0).astype(int)
-            total_birds = group.sum().sum().astype(int)
+            subset = group.drop(columns=['row_id']).copy()
+            subset = subset.loc[:, (subset == 1).any()]
+            duration_seconds = len(subset) * 5
+            remaining_columns = subset.columns
+            column_sums = subset.sum(axis=0).astype(int)
+            total_birds = subset.sum().sum().astype(int)
             sorted_with_values = [f'{col} ({column_sums[col]})' for col in column_sums.sort_values(ascending=False).index]
             
             all_birds = ', '.join(sorted_with_values)
@@ -861,9 +692,9 @@ class DeriveResults():
 
     def first_detected(self, df: pd.DataFrame) -> pd.DataFrame:
         def _first_detected(group):
-            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
-            group = group.reset_index(drop=True)
-            first_non_zero = group.apply(lambda col: col.ne(0).idxmax()*5 if col.ne(0).any() else np.nan)
+            subset = group.drop(columns=['row_id']).copy()
+            subset = subset.reset_index(drop=True)
+            first_non_zero = subset.apply(lambda col: col.ne(0).idxmax()*5 if col.ne(0).any() else np.nan)
             return first_non_zero
         grouped = df.groupby('File_Path')
         first_bird = grouped.apply(_first_detected, include_groups=False).reset_index(drop=False)
@@ -873,10 +704,10 @@ class DeriveResults():
 
     def last_detected(self, df: pd.DataFrame) -> pd.DataFrame:
         def _last_detected(group):
-            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
-            group = group.reset_index(drop=True)
-            length = len(group) * 5
-            last_non_zero = group.apply(lambda col: length - (col[::-1].ne(0).idxmax()) * 5 if col.ne(0).any() else np.nan)
+            subset = group.drop(columns=['row_id']).copy()
+            subset = subset.reset_index(drop=True)
+            length = len(subset) * 5
+            last_non_zero = subset.apply(lambda col: length - (col[::-1].ne(0).idxmax()) * 5 if col.ne(0).any() else np.nan)
             return last_non_zero
         grouped = df.groupby('File_Path')
         last_bird = grouped.apply(_last_detected, include_groups=False).reset_index(drop=False)
@@ -886,12 +717,12 @@ class DeriveResults():
 
     def detections_per_minute(self, df: pd.DataFrame) -> pd.DataFrame:
         def _detections_per_minute(group):
-            group.drop(columns=['row_id'], inplace=True)  # ISSUE #6: In-place operation on view - may fail if group is a view 
-            group = group.reset_index(drop=True)
-            minutes = len(group) / 12
-            column_sums = group.sum(axis=0).astype(int)
+            subset = group.drop(columns=['row_id']).copy()
+            subset = subset.reset_index(drop=True)
+            minutes = len(subset) / 12
+            column_sums = subset.sum(axis=0).astype(int)
             bird_rate = column_sums / minutes
-            bird_rates = pd.Series(bird_rate, index=group.columns).round(3).astype('float32')
+            bird_rates = pd.Series(bird_rate, index=subset.columns).round(3).astype('float32')
             return bird_rates
         grouped = df.groupby('File_Path')
         bird_rate = grouped.apply(_detections_per_minute, include_groups=False).reset_index(drop=False) 
@@ -954,16 +785,15 @@ def merge_classes(df: pd.DataFrame, ebirds: List[str], short_names: List[str]) -
 ##################################################################################################
 
 def infer_soundscapes(use_case: Dict[str, Any]) -> None:
-    audio = AudioParameters()
     paths = FilePaths(options=use_case)
     bird_map_df = pd.read_csv(paths.bird_list_path)
     birdnames = BirdNamer(bird_map_df)
     cfg = DefaultConfig(bird_namer=birdnames, 
                         options=use_case)
     parameters = ModelParameters(options=use_case)
+    print(parameters.parameters[0])
     models = Models(config=cfg, 
-                    model_parameters=parameters, 
-                    audio_parameters=audio)
+                    model_parameters=parameters)
     summary_birds = use_case['birds_to_summarise']
     naming_scheme = use_case['naming_scheme']
     threshold = use_case['threshold']
@@ -986,6 +816,7 @@ def infer_soundscapes(use_case: Dict[str, Any]) -> None:
     prediction_dfs = []
     for idx in range(len(models.args_list)):
         df = inference(paths.soundscapes, models, idx, cores=cfg.CORES)
+        #print(f'The final predictions dataframe has length {len(df)}')
         prediction_dfs.append(df)
 
     prediction_columns = prediction_dfs[0].columns[2:]
@@ -1009,20 +840,21 @@ def infer_soundscapes(use_case: Dict[str, Any]) -> None:
     print(predictions.iloc[:5, :8])
 
     predictions.to_csv(paths.predictions / 'prediction_probabilities.csv', index=False)
-    predictions.iloc[:,2:] = (predictions.iloc[:,2:] > threshold).astype(int)
+    bin_preds = predictions.copy()
+    bin_preds.iloc[:,2:] = (bin_preds.iloc[:,2:] > threshold).astype(int)
 
     print(Colour.S + 'Thresholded scores for the first 8 birds' + Colour.E)
-    print(predictions.iloc[:5, :8])
+    print(bin_preds.iloc[:5, :8])
 
     if naming_scheme == 'Short':
         short_names  = birdnames.extra_names(birdnames.bird_list)  #we need to do this way for the one-many relationship
-        predictions = merge_classes(predictions, birdnames.bird_list, short_names)
+        bin_preds = merge_classes(bin_preds, birdnames.bird_list, short_names)
 
         print(Colour.S + 'Merged scores for the first 8 birds' + Colour.E)
-        print(predictions.iloc[:5, :8])
+        print(bin_preds.iloc[:5, :8])
 
     #Derive various alternative data represenations
-    post_processor = DeriveResults(predictions,  
+    post_processor = DeriveResults(bin_preds,  
                                    save_folder=paths.predictions,
                                    )
     post_processor.derive_results()
@@ -1031,6 +863,7 @@ def infer_soundscapes(use_case: Dict[str, Any]) -> None:
         post_processor.summarise_chosen_birds(summary_birds)
     post_processor.save_results()
     post_processor.print_results()
+    return predictions
 
 ############################################  Run Main  ##########################################
 ##################################################################################################
@@ -1038,17 +871,18 @@ def infer_soundscapes(use_case: Dict[str, Any]) -> None:
 if __name__ == '__main__':
     #Default options for running during development
     options = {
-                'project_root': '/home/olly/Desktop/Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
-                'experiment': None, #None to use what ever is in the Models folder, otherwise an integer for the experiment number
-                'threshold': 0.3,
-                #'folder_to_process': '/home/olly/Desktop/Kaytoo/data/more_corrupt_files',# 'D:/Kaytoo/Data/Corrupt_Files', #'D:/Kaytoo/Data/Soundscapes/debugging',
-                'folder_to_process':'/home/olly/Desktop/Kaytoo/data/corrupt_files',
-                'results_folder': '/home/olly/Desktop/Kaytoo/predictions',
-                'naming_scheme' : 'Short', #'Scientific', #'Short, Long, Scientific, eBird'
-                'cpu_only': False,
-                'num_cores': 1,  #Can crank this up if using CPU only.
-                'birds_to_summarise':['Spotted Kiwi'], #['Chlidonias albostriatus']  #['Australian Magpie'],  Black-fronted Tern blfter1	Chlidonias albostriatus	Tern
-                }
+            'project_root': '/home/olly/Desktop/Kaytoo', #'/media/olly/T7/Kaytoo', #'/media/olly/T7/Kaytoo', # 'G:/Kaytoo',  #'/media/olly/T7/Kaytoo'  
+            'experiment': None, #None to use what ever is in the Models folder, otherwise an integer for the experiment number
+            'threshold': 0.3,
+            #'folder_to_process': '/home/olly/Desktop/Kaytoo/data/more_corrupt_files',# 'D:/Kaytoo/Data/Corrupt_Files', #'D:/Kaytoo/Data/Soundscapes/debugging',
+            #'folder_to_process':'/home/olly/Desktop/Kaytoo/data/moira_samples',
+            'folder_to_process':'/home/olly/Desktop/Kaytoo/data/Train_Xeno_Canto/train_audio/morepo2',
+            'results_folder': '/home/olly/Desktop/Kaytoo/data/moira_samples',
+            'naming_scheme' : 'Short', #'Scientific', #'Short, Long, Scientific, eBird'
+            'cpu_only': True,
+            'num_cores': 1,  #Can crank this up if using CPU only.
+            'birds_to_summarise':['Morepork', 'Kaka'], #['Chlidonias albostriatus']  #['Australian Magpie'],  Black-fronted Tern blfter1	Chlidonias albostriatus	Tern
+            }
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--project_root", type=str, default=None, help="Filepath to the root directory (parent of the 'Python' folder)")

@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         self.info_label = QLabel("Identification of New Zealand birds from sound recordings")
         self.info_label.setObjectName("info_label")
 
-        source_1 = HoverLabel("Version 2.00 | November 2025 | ", "Documentation", "https://wekaresearch.com")
+        source_1 = HoverLabel("Version 2.02 | December 2025 | ", "Documentation", "https://wekaresearch.com")
         source_2 = HoverLabel("|", "Source Code", "https://github.com/Wologman/Kaytoo")
         
         self.sources_layout = QHBoxLayout()
