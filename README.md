@@ -9,7 +9,9 @@ New Zealand Bird Call Classification
 
 - The model architecture will soon be replaced with one that works with time-frequency annotated soundscapes, both for the underlying dataset and at inference.  The predictions will then be visualisable in [Raven](https://www.ravensoundsoftware.com/software/raven-pro/), and can contribute to human-in-loop improvement of the underlying traning data.
   
-- I am building a new data standard (Anqa), and will update the [New Zealand bird-sound dataset](https://www.kaggle.com/datasets/ollypowell/new-zealand-bird-sound)  into that format.  I hope to publish the new dataset on [Zenodo](https://zenodo.org/) by mid 2026.  The methods that I'm building up to support the Anqa data standard will be a part of the [wildpytools](https://github.com/Wologman/wildpytools) package.
+- I am building a new data standard (Anqa), and will update the [New Zealand bird-sound dataset](https://www.kaggle.com/datasets/ollypowell/new-zealand-bird-sound)  into that format.  I hope to publish the new dataset on [Zenodo](https://zenodo.org/) by mid 2026.
+
+- The methods that I'm building up to support the Anqa data standard, plus other helpful methods for analysis will be a part of the [wildpytools](https://github.com/Wologman/wildpytools) package.
 
 - The underlying motivation for the focus on data standards it to enable *Regional Datasets* and accompanying *Regional Models* in a compatible format, so that methods become sharable, and models for different regions can be easily built from the same training code-base.  Also the model outputs will in a form that ecologists can more easily use for their statistical models.
 
